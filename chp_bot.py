@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier (v5)
+CHP Traffic -> Telegram notifier (v5.1)
 - Выбирает Communications Center (ASP.NET postback)
 - Фильтрует только Collision
-- Для каждой строки жмёт её "Details" через __doPostBack и вытаскивает координаты из ссылки рядом с "Lat/Lon:"
-- Отправляет маршрут Google Maps по координатам (без текстового поиска)
+- Для каждой строки делает postback по "Details"
+- Из HTML Details:
+  * достаёт координаты из ссылки рядом с "Lat/Lon:"
+  * собирает текст раздела "Detail Information" (последние 3–5 записей)
+- Отправляет маршрут Google Maps по координатам + блок Detail Information (если есть)
 
 .env:
   TELEGRAM_TOKEN=...
@@ -77,7 +80,7 @@ def send_telegram(text: str) -> None:
         print("[ERR] Telegram send error:", e)
 
 # ---------- работа с формой ASP.NET ----------
-def extract_form_state(soup: BeautifulSoup) -> Tuple[str, Dict[str, str]]:
+def extract_form_state(soup: BeautifulSoup):
     """Возвращает (action_url, payload) со всеми скрытыми полями формы (__VIEWSTATE, и т.д.)"""
     form = soup.find("form")
     if not form:
@@ -170,8 +173,8 @@ def choose_communications_center(session: requests.Session) -> str:
     r2.raise_for_status()
     return r2.text
 
-# ---------- парсинг таблицы и постбэки Details ----------
-def find_incidents_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+# ---------- парсинг таблицы и postback Details ----------
+def find_incidents_table(soup: BeautifulSoup):
     for table in soup.find_all("table"):
         header = table.find("tr")
         if not header:
@@ -181,8 +184,8 @@ def find_incidents_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
             return table
     return None
 
-def parse_incidents_with_postbacks(html: str) -> Tuple[BeautifulSoup, List[Dict[str, str]]]:
-    """Возвращает soup и список инцидентов, где для каждой строки извлекает параметры __doPostBack"""
+def parse_incidents_with_postbacks(html: str):
+    """Возвращает soup и список инцидентов, где для каждой строки извлекаем параметры __doPostBack"""
     soup = BeautifulSoup(html, "html.parser")
     table = find_incidents_table(soup)
     if not table:
@@ -212,9 +215,9 @@ def parse_incidents_with_postbacks(html: str) -> Tuple[BeautifulSoup, List[Dict[
         })
     return soup, incidents
 
-def extract_coords_from_details_html(html: str) -> Optional[Tuple[float, float]]:
+# ---------- разбор страницы Details ----------
+def extract_coords_from_details_html(soup: BeautifulSoup) -> Optional[Tuple[float, float]]:
     """Из блока Details достаём координаты из ссылки рядом с 'Lat/Lon:'"""
-    soup = BeautifulSoup(html, "html.parser")
     label = soup.find(string=re.compile(r"Lat\s*/?\s*Lon", re.IGNORECASE))
     a = None
     if label:
@@ -234,16 +237,43 @@ def extract_coords_from_details_html(html: str) -> Optional[Tuple[float, float]]
             return (lat, lon)
     return None
 
-def fetch_coords_by_postback(session: requests.Session, action_url: str, base_payload: Dict[str, str],
-                             target: str, argument: str) -> Optional[Tuple[float, float]]:
-    """Имитация клика по 'Details' через __EVENTTARGET/__EVENTARGUMENT"""
+def extract_detail_information_text(soup: BeautifulSoup, max_lines: int = 4) -> Optional[List[str]]:
+    """
+    Возвращает список строк из блока 'Detail Information' (верхние последние max_lines).
+    Ищем заголовок 'Detail Information' и берём текст до следующего заголовка 'Unit Information' (если есть).
+    """
+    flat = soup.get_text("\n", strip=True)
+    # Найти начало блока
+    m_start = re.search(r"(?im)^Detail Information$", flat)
+    if not m_start:
+        return None
+    start = m_start.end()
+
+    # Найти конец блока
+    m_end = re.search(r"(?im)^(Unit Information|Close)$", flat[start:])
+    end = start + (m_end.start() if m_end else len(flat) - start)
+
+    block = flat[start:end]
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    # строки вида: "8:45 AM    3    [13] ...", "8:23 AM   2   On RS" и т.п.
+    # Оставим первые max_lines (обычно в порядке от нового к старому)
+    if not lines:
+        return None
+    return lines[:max_lines]
+
+def fetch_details_by_postback(session: requests.Session, action_url: str, base_payload: Dict[str, str],
+                              target: str, argument: str) -> Tuple[Optional[Tuple[float, float]], Optional[List[str]]]:
+    """Имитация клика по 'Details': возвращает (coords, detail_info_lines)"""
     payload = base_payload.copy()
     payload["__EVENTTARGET"] = target
     payload["__EVENTARGUMENT"] = argument
     post_url = requests.compat.urljoin(BASE_URL, action_url)
     r = session.post(post_url, data=payload, headers=HEADERS, timeout=30)
     r.raise_for_status()
-    return extract_coords_from_details_html(r.text)
+    soup = BeautifulSoup(r.text, "html.parser")
+    coords = extract_coords_from_details_html(soup)
+    info_lines = extract_detail_information_text(soup, max_lines=4)
+    return coords, info_lines
 
 # ---------- фильтры/формат ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -257,7 +287,7 @@ def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
             ok = False
         if ok and area_re and not area_re.search(x["area"]):
             ok = False
-        if ok and loc_re and not (loc_re.search(x["location"]) or loc_re.search(x["locdesc"])):  # noqa
+        if ok and loc_re and not (loc_re.search(x["location"]) or loc_re.search(x["locdesc"])):
             ok = False
         if ok:
             result.append(x)
@@ -267,23 +297,30 @@ def make_key(inc: Dict[str, str]) -> str:
     today = dt.date.today().isoformat()
     return f"{today}:{inc['no']}:{inc['time']}:{inc['type']}"
 
-def format_message(inc: Dict[str, str], lat: Optional[float], lon: Optional[float]) -> str:
+def format_message(inc: Dict[str, str], latlon: Optional[Tuple[float, float]], details: Optional[List[str]]) -> str:
     parts = [
         f"🚨 ДТП {inc['time']}",
         f"{inc['type']}",
         f"📍 {inc['location']} — {inc['locdesc']}",
         f"🏷️ {inc['area']}",
     ]
-    if lat is not None and lon is not None:
-        link = f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving"
-        parts.append(f"🗺️ {link}")
+    if latlon:
+        lat, lon = latlon
+        parts.append(f"🗺️ https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving")
     else:
         parts.append("🗺️ Координаты недоступны")
+
+    if details:
+        # аккуратно выведем 3–4 последних строки
+        parts.append("📝 Detail Information:")
+        for ln in details:
+            parts.append(f"• {ln}")
+
     return "\n".join(parts)
 
 # ---------- главный цикл ----------
 def main() -> None:
-    print(f"[INFO] CHP notifier v5 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
+    print(f"[INFO] CHP notifier v5.1 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
     seen = load_seen()
     last_day = dt.date.today()
     session = requests.Session()
@@ -311,20 +348,15 @@ def main() -> None:
                 if key in seen:
                     continue
 
-                lat = lon = None
+                latlon = None
+                detail_lines = None
                 if inc.get("postback"):
-                    coords = fetch_coords_by_postback(
-                        session,
-                        action_url,
-                        base_payload,
-                        inc["postback"]["target"],
-                        inc["postback"]["argument"],
+                    latlon, detail_lines = fetch_details_by_postback(
+                        session, action_url, base_payload,
+                        inc["postback"]["target"], inc["postback"]["argument"]
                     )
-                    if coords:
-                        lat, lon = coords
 
-                # Отправляем (если координаты не нашлись, линк не будет добавлен)
-                send_telegram(format_message(inc, lat, lon))
+                send_telegram(format_message(inc, latlon, detail_lines))
                 seen[key] = dt.datetime.utcnow().isoformat()
                 new_count += 1
 
