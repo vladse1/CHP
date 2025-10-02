@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier (v5.5, no-LLM summary)
-- Выбирает Communications Center (ASP.NET postback)
-- Фильтрует инциденты по TYPE_REGEX (по умолчанию Collision; можно добавить Hit & Run)
-- Для каждой строки делает постбэк по "Details"
-- Из HTML Details:
-  * достаёт координаты из ссылки рядом с "Lat/Lon:"
-  * берёт ВЕСЬ блок "Detail Information"
-- Формирует сообщение с разделами:
-  Шапка → Итог (РУС) → Маршрут (прямая ссылка-URL) → Detail Information (blockquote)
+CHP Traffic -> Telegram notifier (v5.6, location+count only)
+- Выбирает Communications Center и парсит таблицу
+- По каждой строке делает postback "Details", достаёт координаты и ПОЛНЫЙ блок Detail Information
+- Сообщение содержит:
+  Шапка → (опционально) Расположение/Машины → Маршрут (URL) → Detail Information (blockquote)
+  * Расположение: только "правая обочина" или "CD" или "съезд"
+  * Машины: число (по X VEH / SOLO / VS)
+  * Если ни расположения, ни числа — секция не выводится вообще
 """
 
 import os
@@ -83,7 +82,6 @@ def save_seen(seen: Dict[str, str]) -> None:
 
 # ---------- ASP.NET helpers ----------
 def extract_form_state(soup: BeautifulSoup) -> Tuple[str, Dict[str, str]]:
-    """Возвращает (action_url, payload) со всеми скрытыми полями формы (__VIEWSTATE и т.д.)."""
     form = soup.find("form")
     if not form:
         raise RuntimeError("Не найден <form> на странице")
@@ -116,7 +114,6 @@ def extract_form_state(soup: BeautifulSoup) -> Tuple[str, Dict[str, str]]:
     return action, payload
 
 def choose_communications_center(session: requests.Session) -> str:
-    """Открывает главную, выбирает COMM_CENTER, жмёт OK, возвращает HTML со списком инцидентов."""
     r = session.get(BASE_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -142,7 +139,7 @@ def choose_communications_center(session: requests.Session) -> str:
         raise RuntimeError(f"Не нашёл Communications Center '{COMM_CENTER}'")
     payload[comm_select.get("name")] = option_value
 
-    # найти submit и нажать
+    # submit
     form = soup.find("form")
     submit_name = submit_value = None
     for btn in form.find_all("input", {"type": "submit"}):
@@ -266,65 +263,50 @@ def fetch_details_by_postback(session: requests.Session, action_url: str, base_p
     details_block_html = extract_detail_information_block_from_lines(lines) if lines else None
     return coords, details_block_html, lines
 
-# ---------- Эвристическая сводка (РУС) ----------
-def summarize_heuristic_ru(detail_lines: List[str], inc: Dict[str, str]) -> str:
+# ---------- ВЫЧИСЛЕНИЕ: расположение + число машин ----------
+BARRIER_WORDS = {"BARRIER", "GUARDRAIL", "FENCE", "DEBRIS", "ANIMAL", "DEER", "TREE", "POLE", "SIGN"}
+
+def parse_location_and_count(detail_lines: Optional[List[str]]) -> Tuple[Optional[str], Optional[int]]:
     """
-    Быстрая эвристика без ИИ: примерное число ТС, расположение (полоса/обочина), травмы, краткий вывод.
+    Возвращает (location_label, veh_count)
+      location_label ∈ {"правая обочина", "CD", "съезд"} или None
+      veh_count ∈ {1,2,...} или None
     """
     if not detail_lines:
-        return "No details"
+        return None, None
 
     text_up = " ".join(detail_lines).upper()
 
-    # Кол-во авто (X VEH), SOLO VEH — одно авто
-    veh_nums = [int(n) for n in re.findall(r"\b(\d{1,2})\s*VEH", text_up)]
-    veh_count = max(veh_nums) if veh_nums else (1 if "SOLO VEH" in text_up else None)
-
-    # Полосы / обочины / разделитель
-    lane = None
-    m_lane = re.search(r"\bLANE\s*(\d+)\b", text_up)
-    if m_lane:
-        lane = m_lane.group(1)
-    place_bits = []
+    # --- РАСПОЛОЖЕНИЕ ---
+    # правая обочина
+    loc = None
     if re.search(r"\bRS\b|\bRIGHT SHOULDER\b", text_up):
-        place_bits.append("правая обочина")
-    if re.search(r"\bLS\b|\bLEFT SHOULDER\b", text_up):
-        place_bits.append("левая обочина")
+        loc = "правая обочина"
+    # CD (center divider)
     if re.search(r"\bCD\b|\bCENTER DIVIDER\b", text_up):
-        place_bits.append("центральная разделительная")
-    if lane:
-        place_bits.insert(0, f"полоса {lane}")
+        loc = "CD"
+    # съезд (on/off ramp, exit)
+    if re.search(r"\bON[- ]?RAMP\b|\bOFF[- ]?RAMP\b|\bEXIT\b", text_up):
+        loc = "съезд"
 
-    # Блокировки / травмы
-    blocked = bool(re.search(r"\bBLOCK(ED|ING)?\b", text_up)) or "LANE CLOS" in text_up
-    injuries = bool(re.search(r"\bINJ(URY|URIES)?\b|\bWITH INJURIES\b", text_up))
+    # --- КОЛ-ВО МАШИН ---
+    # X VEH / SOLO VEH
+    nums = [int(n) for n in re.findall(r"\b(\d{1,2})\s*VEH\b", text_up)]
+    veh_count = max(nums) if nums else None
+    if veh_count is None and "SOLO VEH" in text_up:
+        veh_count = 1
 
-    # Тип + место из таблицы
-    typename = inc.get("type", "").strip()
-    loc = inc.get("location", "").strip()
-    locdesc = inc.get("locdesc", "").strip()
+    # "XXX VS YYY" — считаем как 2 ТС, если обе стороны не из BARRIER_WORDS
+    if veh_count is None and re.search(r"\bVS\b", text_up):
+        # возьмём пару первых слов по шаблону "... VS ..."
+        m = re.search(r"\b([A-Z0-9/&\- ]{2,30}?)\s+VS\s+([A-Z0-9/&\- ]{2,30}?)\b", text_up)
+        if m:
+            left = m.group(1).strip().split()[0]
+            right = m.group(2).strip().split()[0]
+            if left not in BARRIER_WORDS and right not in BARRIER_WORDS:
+                veh_count = 2
 
-    parts = []
-    if typename:
-        parts.append(typename)
-    if loc or locdesc:
-        parts.append(f"Место: {loc} — {locdesc}")
-    if veh_count:
-        parts.append(f"Участников: ~{veh_count} ТС")
-    if place_bits:
-        parts.append("Расположение: " + ", ".join(place_bits))
-    if blocked:
-        parts.append("Есть блокировки/перекрытия.")
-    if injuries:
-        parts.append("Сообщают о пострадавших.")
-    if not parts:
-        return "Кратких сведений мало. Подробности в журнале ниже."
-    return " ".join(parts)
-
-def make_summary_ru(detail_lines: Optional[List[str]], inc: Dict[str, str]) -> str:
-    if not detail_lines:
-        return "No details"
-    return summarize_heuristic_ru(detail_lines, inc) or "No details"
+    return loc, veh_count
 
 # ---------- фильтры/формат ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -347,7 +329,8 @@ def make_key(inc: Dict[str, str]) -> str:
 def format_message(inc: Dict[str, str],
                    latlon: Optional[Tuple[float, float]],
                    details_block: Optional[str],
-                   summary_ru: str) -> str:
+                   loc_label: Optional[str],
+                   veh_count: Optional[int]) -> str:
     # Шапка
     title = (
         f"🚨 ДТП {html.escape(inc['time'])}\n"
@@ -356,10 +339,16 @@ def format_message(inc: Dict[str, str],
         f"🏷️ {html.escape(inc['area'])}"
     )
 
-    # Итог
-    title += f"\n\n<b>🧾 Итог:</b>\n{html.escape(summary_ru)}"
+    # Раздел «Расположение/Машины» — только если есть что сказать
+    lines = []
+    if loc_label:
+        lines.append(loc_label)
+    if veh_count is not None:
+        lines.append(f"{veh_count} ТС")
+    if lines:
+        title += "\n\n<b>📌 Расположение / Машины:</b>\n" + ", ".join(lines)
 
-    # Маршрут (прямая ссылка)
+    # Маршрут
     if latlon:
         lat, lon = latlon
         url = f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving"
@@ -375,7 +364,7 @@ def format_message(inc: Dict[str, str],
 
 # ---------- главный цикл ----------
 def main() -> None:
-    print(f"[INFO] CHP notifier v5.5 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
+    print(f"[INFO] CHP notifier v5.6 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
     seen = load_seen()
     last_day = dt.date.today()
     session = requests.Session()
@@ -406,8 +395,8 @@ def main() -> None:
                         inc["postback"]["target"], inc["postback"]["argument"]
                     )
 
-                summary = make_summary_ru(detail_lines, inc)
-                text = format_message(inc, latlon, details_block, summary)
+                loc_label, veh_count = parse_location_and_count(detail_lines)
+                text = format_message(inc, latlon, details_block, loc_label, veh_count)
                 send_telegram(text)
                 seen[key] = dt.datetime.utcnow().isoformat()
                 new_count += 1
