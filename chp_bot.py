@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier (v5.3)
+CHP Traffic -> Telegram notifier (v5.5, no-LLM summary)
 - Выбирает Communications Center (ASP.NET postback)
 - Фильтрует инциденты по TYPE_REGEX (по умолчанию Collision; можно добавить Hit & Run)
 - Для каждой строки делает постбэк по "Details"
 - Из HTML Details:
   * достаёт координаты из ссылки рядом с "Lat/Lon:"
-  * берёт ВЕСЬ блок "Detail Information" и отправляет его как цитату (HTML <blockquote> с \n)
-- Шлёт кнопку "Открыть маршрут" (если нужно — включи в send_telegram вызове)
+  * берёт ВЕСЬ блок "Detail Information"
+- Формирует сообщение с разделами:
+  Шапка → Итог (РУС) → Маршрут (прямая ссылка-URL) → Detail Information (blockquote)
 """
 
 import os
@@ -49,8 +50,8 @@ HEADERS = {
 }
 
 # ---------- Telegram ----------
-def send_telegram(text: str, button_url: Optional[str] = None) -> None:
-    """Отправка сообщения с parse_mode=HTML. Можно прикрепить inline-кнопку."""
+def send_telegram(text: str) -> None:
+    """Отправка сообщения с parse_mode=HTML (без инлайн-кнопок)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[WARN] TELEGRAM_TOKEN/CHAT_ID не заданы. Не отправляю:\n", text)
         return
@@ -61,9 +62,6 @@ def send_telegram(text: str, button_url: Optional[str] = None) -> None:
         "disable_web_page_preview": True,
         "parse_mode": "HTML",
     }
-    if button_url:
-        kb = {"inline_keyboard": [[{"text": "🗺 Открыть маршрут", "url": button_url}]]}
-        payload["reply_markup"] = json.dumps(kb)
     r = requests.post(api, data=payload, timeout=20)
     if r.status_code != 200:
         print("[ERR] Telegram API:", r.status_code, r.text[:400])
@@ -221,11 +219,8 @@ def extract_coords_from_details_html(soup: BeautifulSoup) -> Optional[Tuple[floa
             return (lat, lon)
     return None
 
-def extract_detail_information_block(soup: BeautifulSoup) -> Optional[str]:
-    """
-    Возвращает ПОЛНЫЙ блок 'Detail Information' как HTML-цитату.
-    Используем переносы строк '\\n' (никаких <br>), чтобы Telegram не ругался.
-    """
+def extract_detail_lines(soup: BeautifulSoup) -> Optional[List[str]]:
+    """Сырые строки блока 'Detail Information'."""
     flat = soup.get_text("\n", strip=True)
 
     m_start = re.search(r"(?im)^Detail Information$", flat)
@@ -237,17 +232,15 @@ def extract_detail_information_block(soup: BeautifulSoup) -> Optional[str]:
     end = start + (m_end.start() if m_end else len(flat) - start)
 
     block = flat[start:end]
-
-    # нормализуем строку: уберём лишние пробелы, пустые строки
     lines = []
     for raw in block.splitlines():
         s = " ".join(raw.split()).strip()
         if s:
             lines.append(s)
-    if not lines:
-        return None
+    return lines or None
 
-    # собираем и ограничиваем длину
+def extract_detail_information_block_from_lines(lines: List[str]) -> str:
+    """HTML-цитата (<blockquote>) из списка строк. Без <br>, переносы — \n."""
     acc = ""
     for ln in lines:
         piece = html.escape(ln)
@@ -256,12 +249,11 @@ def extract_detail_information_block(soup: BeautifulSoup) -> Optional[str]:
             acc += ("\n" if acc else "") + "… (truncated)"
             break
         acc = candidate
-
     return f"<blockquote>{acc}</blockquote>"
 
 def fetch_details_by_postback(session: requests.Session, action_url: str, base_payload: Dict[str, str],
-                              target: str, argument: str) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
-    """Жмём 'Details' через __EVENTTARGET/__EVENTARGUMENT и парсим координаты + полный блок Detail Information."""
+                              target: str, argument: str) -> Tuple[Optional[Tuple[float, float]], Optional[str], Optional[List[str]]]:
+    """Жмём 'Details' и возвращаем (coords, details_block_html, detail_lines_raw)."""
     payload = base_payload.copy()
     payload["__EVENTTARGET"] = target
     payload["__EVENTARGUMENT"] = argument
@@ -270,8 +262,69 @@ def fetch_details_by_postback(session: requests.Session, action_url: str, base_p
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     coords = extract_coords_from_details_html(soup)
-    details_block = extract_detail_information_block(soup)
-    return coords, details_block
+    lines = extract_detail_lines(soup)
+    details_block_html = extract_detail_information_block_from_lines(lines) if lines else None
+    return coords, details_block_html, lines
+
+# ---------- Эвристическая сводка (РУС) ----------
+def summarize_heuristic_ru(detail_lines: List[str], inc: Dict[str, str]) -> str:
+    """
+    Быстрая эвристика без ИИ: примерное число ТС, расположение (полоса/обочина), травмы, краткий вывод.
+    """
+    if not detail_lines:
+        return "No details"
+
+    text_up = " ".join(detail_lines).upper()
+
+    # Кол-во авто (X VEH), SOLO VEH — одно авто
+    veh_nums = [int(n) for n in re.findall(r"\b(\d{1,2})\s*VEH", text_up)]
+    veh_count = max(veh_nums) if veh_nums else (1 if "SOLO VEH" in text_up else None)
+
+    # Полосы / обочины / разделитель
+    lane = None
+    m_lane = re.search(r"\bLANE\s*(\d+)\b", text_up)
+    if m_lane:
+        lane = m_lane.group(1)
+    place_bits = []
+    if re.search(r"\bRS\b|\bRIGHT SHOULDER\b", text_up):
+        place_bits.append("правая обочина")
+    if re.search(r"\bLS\b|\bLEFT SHOULDER\b", text_up):
+        place_bits.append("левая обочина")
+    if re.search(r"\bCD\b|\bCENTER DIVIDER\b", text_up):
+        place_bits.append("центральная разделительная")
+    if lane:
+        place_bits.insert(0, f"полоса {lane}")
+
+    # Блокировки / травмы
+    blocked = bool(re.search(r"\bBLOCK(ED|ING)?\b", text_up)) or "LANE CLOS" in text_up
+    injuries = bool(re.search(r"\bINJ(URY|URIES)?\b|\bWITH INJURIES\b", text_up))
+
+    # Тип + место из таблицы
+    typename = inc.get("type", "").strip()
+    loc = inc.get("location", "").strip()
+    locdesc = inc.get("locdesc", "").strip()
+
+    parts = []
+    if typename:
+        parts.append(typename)
+    if loc or locdesc:
+        parts.append(f"Место: {loc} — {locdesc}")
+    if veh_count:
+        parts.append(f"Участников: ~{veh_count} ТС")
+    if place_bits:
+        parts.append("Расположение: " + ", ".join(place_bits))
+    if blocked:
+        parts.append("Есть блокировки/перекрытия.")
+    if injuries:
+        parts.append("Сообщают о пострадавших.")
+    if not parts:
+        return "Кратких сведений мало. Подробности в журнале ниже."
+    return " ".join(parts)
+
+def make_summary_ru(detail_lines: Optional[List[str]], inc: Dict[str, str]) -> str:
+    if not detail_lines:
+        return "No details"
+    return summarize_heuristic_ru(detail_lines, inc) or "No details"
 
 # ---------- фильтры/формат ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -293,28 +346,36 @@ def make_key(inc: Dict[str, str]) -> str:
 
 def format_message(inc: Dict[str, str],
                    latlon: Optional[Tuple[float, float]],
-                   details_block: Optional[str]) -> Tuple[str, Optional[str]]:
+                   details_block: Optional[str],
+                   summary_ru: str) -> str:
+    # Шапка
     title = (
         f"🚨 ДТП {html.escape(inc['time'])}\n"
         f"{html.escape(inc['type'])}\n"
         f"📍 {html.escape(inc['location'])} — {html.escape(inc['locdesc'])}\n"
         f"🏷️ {html.escape(inc['area'])}"
     )
-    route_url = None
+
+    # Итог
+    title += f"\n\n<b>🧾 Итог:</b>\n{html.escape(summary_ru)}"
+
+    # Маршрут (прямая ссылка)
     if latlon:
         lat, lon = latlon
-        route_url = f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving"
-        title += f"\n🗺️ <a href=\"{route_url}\">Открыть маршрут</a>"
+        url = f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving"
+        title += f"\n\n<b>🗺️ Маршрут:</b>\n{url}"
     else:
-        title += "\n🗺️ Координаты недоступны"
+        title += "\n\n<b>🗺️ Маршрут:</b>\nКоординаты недоступны"
 
+    # Полный Detail Information
     if details_block:
-        title += f"\n📝 <b>Detail Information</b>:\n{details_block}"
-    return title, route_url
+        title += f"\n\n<b>📝 Detail Information:</b>\n{details_block}"
+
+    return title
 
 # ---------- главный цикл ----------
 def main() -> None:
-    print(f"[INFO] CHP notifier v5.3 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
+    print(f"[INFO] CHP notifier v5.5 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
     seen = load_seen()
     last_day = dt.date.today()
     session = requests.Session()
@@ -338,15 +399,16 @@ def main() -> None:
 
                 latlon = None
                 details_block = None
+                detail_lines = None
                 if inc.get("postback"):
-                    latlon, details_block = fetch_details_by_postback(
+                    latlon, details_block, detail_lines = fetch_details_by_postback(
                         session, action_url, base_payload,
                         inc["postback"]["target"], inc["postback"]["argument"]
                     )
 
-                text, url = format_message(inc, latlon, details_block)
-                # если хочешь кнопку — передай button_url=url
-                send_telegram(text)  # send_telegram(text, button_url=url)
+                summary = make_summary_ru(detail_lines, inc)
+                text = format_message(inc, latlon, details_block, summary)
+                send_telegram(text)
                 seen[key] = dt.datetime.utcnow().isoformat()
                 new_count += 1
 
