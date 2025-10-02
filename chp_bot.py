@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier (v4)
-- Выбор Communications Center (ASP.NET postback)
-- Берёт только Collision
-- Для каждой записи открывает "Details" и достаёт координаты из ссылки после текста "Lat/Lon:"
-- Всегда строит маршрут Google Maps по точным координатам (если координаты не найдены — карта не прикладывается)
+CHP Traffic -> Telegram notifier (v5)
+- Выбирает Communications Center (ASP.NET postback)
+- Фильтрует только Collision
+- Для каждой строки жмёт её "Details" через __doPostBack и вытаскивает координаты из ссылки рядом с "Lat/Lon:"
+- Отправляет маршрут Google Maps по координатам (без текстового поиска)
+
+.env:
+  TELEGRAM_TOKEN=...
+  TELEGRAM_CHAT_ID=...
+  COMM_CENTER=Inland
+  POLL_INTERVAL=30
+  TYPE_REGEX=Collision
 """
+
 import os
 import re
 import time
 import json
-import urllib.parse
 import datetime as dt
 from typing import List, Dict, Optional, Tuple
 
@@ -41,6 +48,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
 }
 
+# ---------- утилиты хранения ----------
 def load_seen() -> Dict[str, str]:
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
@@ -57,7 +65,7 @@ def save_seen(seen: Dict[str, str]) -> None:
 
 def send_telegram(text: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не заданы. Сообщение не отправлено:\n", text)
+        print("[WARN] TELEGRAM_TOKEN/CHAT_ID не заданы. Сообщение не отправлено:\n", text)
         return
     api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
@@ -68,22 +76,24 @@ def send_telegram(text: str) -> None:
     except Exception as e:
         print("[ERR] Telegram send error:", e)
 
-def extract_form(ctx: BeautifulSoup):
-    form = ctx.find("form")
+# ---------- работа с формой ASP.NET ----------
+def extract_form_state(soup: BeautifulSoup) -> Tuple[str, Dict[str, str]]:
+    """Возвращает (action_url, payload) со всеми скрытыми полями формы (__VIEWSTATE, и т.д.)"""
+    form = soup.find("form")
     if not form:
-        raise RuntimeError("Не найден тег <form>")
+        raise RuntimeError("Не найден <form> на странице")
     action = form.get("action") or BASE_URL
-    payload = {}
+    payload: Dict[str, str] = {}
     for inp in form.find_all("input"):
         name = inp.get("name")
         if not name:
             continue
         t = (inp.get("type") or "").lower()
+        if t in ("submit", "button", "image"):
+            continue
         if t in ("checkbox", "radio"):
             if inp.has_attr("checked"):
                 payload[name] = inp.get("value", "on")
-        elif t in ("submit", "button", "image"):
-            continue
         else:
             payload[name] = inp.get("value", "")
     for sel in form.find_all("select"):
@@ -101,18 +111,20 @@ def extract_form(ctx: BeautifulSoup):
     return action, payload
 
 def choose_communications_center(session: requests.Session) -> str:
+    """Открывает главную, выбирает COMM_CENTER, жмёт OK, возвращает HTML со списком инцидентов."""
     r = session.get(BASE_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    action, payload = extract_form(soup)
+    action, payload = extract_form_state(soup)
+
+    # находим селект для "Communications Centers"
+    def looks_like_comm_select(sel) -> bool:
+        text = (sel.find_previous(string=True) or "") + " " + (sel.find_next(string=True) or "")
+        return "communications" in str(text).lower() and "center" in str(text).lower()
 
     selects = soup.find_all("select")
     if not selects:
         raise RuntimeError("Не найдено ни одного <select> на странице")
-
-    def looks_like_comm_select(sel) -> bool:
-        text = (sel.find_previous(string=True) or "") + " " + (sel.find_next(string=True) or "")
-        return "communications" in str(text).lower() and "center" in str(text).lower()
 
     comm_select = None
     for sel in selects:
@@ -122,8 +134,9 @@ def choose_communications_center(session: requests.Session) -> str:
     if comm_select is None:
         comm_select = selects[0]
 
-    target = COMM_CENTER.strip().lower()
+    # выбираем значение центра по имени
     option_value = None
+    target = COMM_CENTER.strip().lower()
     for opt in comm_select.find_all("option"):
         label = opt.get_text(strip=True).lower()
         if target in label:
@@ -132,9 +145,9 @@ def choose_communications_center(session: requests.Session) -> str:
     if not option_value:
         raise RuntimeError(f"Не нашёл Communications Center '{COMM_CENTER}'")
 
-    name = comm_select.get("name")
-    payload[name] = option_value
+    payload[comm_select.get("name")] = option_value
 
+    # жмём OK (submit)
     form = soup.find("form")
     submit_name = None
     submit_value = None
@@ -157,6 +170,7 @@ def choose_communications_center(session: requests.Session) -> str:
     r2.raise_for_status()
     return r2.text
 
+# ---------- парсинг таблицы и постбэки Details ----------
 def find_incidents_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
     for table in soup.find_all("table"):
         header = table.find("tr")
@@ -167,37 +181,40 @@ def find_incidents_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
             return table
     return None
 
-def parse_incidents_with_links(html: str) -> List[Dict[str, str]]:
+def parse_incidents_with_postbacks(html: str) -> Tuple[BeautifulSoup, List[Dict[str, str]]]:
+    """Возвращает soup и список инцидентов, где для каждой строки извлекает параметры __doPostBack"""
     soup = BeautifulSoup(html, "html.parser")
     table = find_incidents_table(soup)
     if not table:
-        return []
+        return soup, []
     rows = table.find_all("tr")[1:]
-    incidents = []
+    incidents: List[Dict[str, str]] = []
     for row in rows:
         cols = row.find_all("td")
         if len(cols) < 7:
             continue
-        details_href = None
+        # первая колонка: "Details"
         a = cols[0].find("a")
-        if a and a.get("href"):
-            details_href = requests.compat.urljoin(BASE_URL, a.get("href"))
-        no = cols[1].get_text(strip=True)
-        tm = cols[2].get_text(strip=True)
-        itype = cols[3].get_text(strip=True)
-        loc = cols[4].get_text(strip=True)
-        locdesc = cols[5].get_text(strip=True)
-        area = cols[6].get_text(strip=True)
+        postback = None
+        if a and a.get("href", "").startswith("javascript:__doPostBack"):
+            m = re.search(r"__doPostBack\('([^']+)','([^']*)'\)", a["href"])
+            if m:
+                postback = {"target": m.group(1), "argument": m.group(2)}
+
         incidents.append({
-            "no": no, "time": tm, "type": itype,
-            "location": loc, "locdesc": locdesc, "area": area,
-            "details_href": details_href
+            "no": cols[1].get_text(strip=True),
+            "time": cols[2].get_text(strip=True),
+            "type": cols[3].get_text(strip=True),
+            "location": cols[4].get_text(strip=True),
+            "locdesc": cols[5].get_text(strip=True),
+            "area": cols[6].get_text(strip=True),
+            "postback": postback
         })
-    return incidents
+    return soup, incidents
 
 def extract_coords_from_details_html(html: str) -> Optional[Tuple[float, float]]:
+    """Из блока Details достаём координаты из ссылки рядом с 'Lat/Lon:'"""
     soup = BeautifulSoup(html, "html.parser")
-    # Ищем текст 'Lat/Lon:' и ближайшую ссылку <a>
     label = soup.find(string=re.compile(r"Lat\s*/?\s*Lon", re.IGNORECASE))
     a = None
     if label:
@@ -205,16 +222,11 @@ def extract_coords_from_details_html(html: str) -> Optional[Tuple[float, float]]
         if parent:
             a = parent.find("a", href=True) or parent.find_next("a", href=True)
     if not a:
+        # запасной поиск любой ссылки с вида '34.123 -117.456'
         a = soup.find("a", href=True, string=re.compile(r"[-+]?\d+(?:\.\d+)?\s+[-+]?\d+(?:\.\d+)?"))
     if not a:
-        # Последний фолбэк: сплошной текст
-        flat = soup.get_text(" ", strip=True)
-        m = re.search(r"Lat\s*/?\s*Lon:\s*([-+]?\d+(?:\.\d+)?)\s*[, ]\s*([-+]?\d+(?:\.\d+)?)", flat, re.IGNORECASE)
-        if m:
-            lat, lon = float(m.group(1)), float(m.group(2))
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                return (lat, lon)
         return None
+
     nums = re.findall(r"[-+]?\d+(?:\.\d+)?", a.get_text(strip=True))
     if len(nums) >= 2:
         lat, lon = float(nums[0]), float(nums[1])
@@ -222,16 +234,18 @@ def extract_coords_from_details_html(html: str) -> Optional[Tuple[float, float]]
             return (lat, lon)
     return None
 
-def try_fetch_latlon_from_details(session: requests.Session, href: str) -> Optional[Tuple[float, float]]:
-    try:
-        r = session.get(href, headers=HEADERS, timeout=30)
-        if r.status_code != 200:
-            return None
-        return extract_coords_from_details_html(r.text)
-    except Exception as e:
-        print("[WARN] Не удалось достать координаты из Details:", e)
-        return None
+def fetch_coords_by_postback(session: requests.Session, action_url: str, base_payload: Dict[str, str],
+                             target: str, argument: str) -> Optional[Tuple[float, float]]:
+    """Имитация клика по 'Details' через __EVENTTARGET/__EVENTARGUMENT"""
+    payload = base_payload.copy()
+    payload["__EVENTTARGET"] = target
+    payload["__EVENTARGUMENT"] = argument
+    post_url = requests.compat.urljoin(BASE_URL, action_url)
+    r = session.post(post_url, data=payload, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return extract_coords_from_details_html(r.text)
 
+# ---------- фильтры/формат ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
     type_re = re.compile(TYPE_REGEX, re.IGNORECASE) if TYPE_REGEX else None
     area_re = re.compile(AREA_REGEX, re.IGNORECASE) if AREA_REGEX else None
@@ -243,7 +257,7 @@ def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
             ok = False
         if ok and area_re and not area_re.search(x["area"]):
             ok = False
-        if ok and loc_re and not (loc_re.search(x["location"]) or loc_re.search(x["locdesc"])):
+        if ok and loc_re and not (loc_re.search(x["location"]) or loc_re.search(x["locdesc"])):  # noqa
             ok = False
         if ok:
             result.append(x)
@@ -267,10 +281,13 @@ def format_message(inc: Dict[str, str], lat: Optional[float], lon: Optional[floa
         parts.append("🗺️ Координаты недоступны")
     return "\n".join(parts)
 
-def main_loop() -> None:
+# ---------- главный цикл ----------
+def main() -> None:
+    print(f"[INFO] CHP notifier v5 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
     seen = load_seen()
     last_day = dt.date.today()
     session = requests.Session()
+
     while True:
         try:
             if dt.date.today() != last_day:
@@ -278,8 +295,14 @@ def main_loop() -> None:
                 last_day = dt.date.today()
                 save_seen(seen)
 
+            # 1) центр и таблица
             html = choose_communications_center(session)
-            incidents = parse_incidents_with_links(html)
+
+            # 2) парсим строки + берём состояние формы
+            soup, incidents = parse_incidents_with_postbacks(html)
+            action_url, base_payload = extract_form_state(soup)
+
+            # 3) фильтруем только Collision
             collisions = filter_collisions(incidents)
 
             new_count = 0
@@ -289,30 +312,32 @@ def main_loop() -> None:
                     continue
 
                 lat = lon = None
-                if inc.get("details_href"):
-                    coords = try_fetch_latlon_from_details(session, inc["details_href"])
+                if inc.get("postback"):
+                    coords = fetch_coords_by_postback(
+                        session,
+                        action_url,
+                        base_payload,
+                        inc["postback"]["target"],
+                        inc["postback"]["argument"],
+                    )
                     if coords:
                         lat, lon = coords
 
-                message = format_message(inc, lat, lon)
-                send_telegram(message)
+                # Отправляем (если координаты не нашлись, линк не будет добавлен)
+                send_telegram(format_message(inc, lat, lon))
                 seen[key] = dt.datetime.utcnow().isoformat()
                 new_count += 1
 
             if new_count:
                 save_seen(seen)
 
-            print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {COMM_CENTER}: total collisions {len(collisions)}, new {new_count}")
+            print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {COMM_CENTER}: rows={len(incidents)}, collisions={len(collisions)}, new={new_count}")
         except KeyboardInterrupt:
             print("\n[INFO] Stopped by user.")
             break
         except Exception as e:
             print("[ERR] loop error:", e)
         time.sleep(POLL_INTERVAL)
-
-def main():
-    print(f"[INFO] CHP notifier v4 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
-    main_loop()
 
 if __name__ == "__main__":
     main()
