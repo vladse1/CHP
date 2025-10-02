@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier (v3)
-- Выбирает Communications Center (ASP.NET postback)
-- Присылает только Collision
-- Добавляет ссылку на Google Maps
-  - сначала пытается достать Lat/Lon из "Details"
-  - если не получилось, делает ссылку по тексту локации
+CHP Traffic -> Telegram notifier (v4)
+- Выбор Communications Center (ASP.NET postback)
+- Берёт только Collision
+- Для каждой записи открывает "Details" и достаёт координаты из ссылки после текста "Lat/Lon:"
+- Всегда строит маршрут Google Maps по точным координатам (если координаты не найдены — карта не прикладывается)
 """
 import os
 import re
@@ -37,9 +36,6 @@ LOCATION_REGEX = os.getenv("LOCATION_REGEX", r"")
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
-
-# управление получением координат
-FETCH_COORDS = os.getenv("FETCH_COORDS", "1") not in ("0", "false", "False", "no", "No")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
@@ -72,7 +68,7 @@ def send_telegram(text: str) -> None:
     except Exception as e:
         print("[ERR] Telegram send error:", e)
 
-def extract_form(ctx: BeautifulSoup) -> Tuple[str, Dict[str,str]]:
+def extract_form(ctx: BeautifulSoup):
     form = ctx.find("form")
     if not form:
         raise RuntimeError("Не найден тег <form>")
@@ -82,7 +78,7 @@ def extract_form(ctx: BeautifulSoup) -> Tuple[str, Dict[str,str]]:
         name = inp.get("name")
         if not name:
             continue
-        t = inp.get("type", "").lower()
+        t = (inp.get("type") or "").lower()
         if t in ("checkbox", "radio"):
             if inp.has_attr("checked"):
                 payload[name] = inp.get("value", "on")
@@ -167,9 +163,7 @@ def find_incidents_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
         if not header:
             continue
         headers = [h.get_text(strip=True).lower() for h in header.find_all(["th", "td"])]
-        if not headers:
-            continue
-        if all(x in headers for x in ["time", "type", "location"]):
+        if headers and all(x in headers for x in ["time", "type", "location"]):
             return table
     return None
 
@@ -184,12 +178,10 @@ def parse_incidents_with_links(html: str) -> List[Dict[str, str]]:
         cols = row.find_all("td")
         if len(cols) < 7:
             continue
-
         details_href = None
         a = cols[0].find("a")
         if a and a.get("href"):
             details_href = requests.compat.urljoin(BASE_URL, a.get("href"))
-
         no = cols[1].get_text(strip=True)
         tm = cols[2].get_text(strip=True)
         itype = cols[3].get_text(strip=True)
@@ -203,22 +195,42 @@ def parse_incidents_with_links(html: str) -> List[Dict[str, str]]:
         })
     return incidents
 
+def extract_coords_from_details_html(html: str) -> Optional[Tuple[float, float]]:
+    soup = BeautifulSoup(html, "html.parser")
+    # Ищем текст 'Lat/Lon:' и ближайшую ссылку <a>
+    label = soup.find(string=re.compile(r"Lat\s*/?\s*Lon", re.IGNORECASE))
+    a = None
+    if label:
+        parent = getattr(label, "parent", None)
+        if parent:
+            a = parent.find("a", href=True) or parent.find_next("a", href=True)
+    if not a:
+        a = soup.find("a", href=True, string=re.compile(r"[-+]?\d+(?:\.\d+)?\s+[-+]?\d+(?:\.\d+)?"))
+    if not a:
+        # Последний фолбэк: сплошной текст
+        flat = soup.get_text(" ", strip=True)
+        m = re.search(r"Lat\s*/?\s*Lon:\s*([-+]?\d+(?:\.\d+)?)\s*[, ]\s*([-+]?\d+(?:\.\d+)?)", flat, re.IGNORECASE)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return (lat, lon)
+        return None
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", a.get_text(strip=True))
+    if len(nums) >= 2:
+        lat, lon = float(nums[0]), float(nums[1])
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return (lat, lon)
+    return None
+
 def try_fetch_latlon_from_details(session: requests.Session, href: str) -> Optional[Tuple[float, float]]:
     try:
         r = session.get(href, headers=HEADERS, timeout=30)
         if r.status_code != 200:
             return None
-        text = r.text
-        m = re.search(r"Lat/Lon:\s*([+-]?\d+\.\d+)\s*[, ]\s*([+-]?\d+\.\d+)", text, re.IGNORECASE)
-        if not m:
-            m = re.search(r"([+-]?\d+\.\d+)\s*[, ]\s*([+-]?\d+\.\d+)", text)
-        if m:
-            lat = float(m.group(1)); lon = float(m.group(2))
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                return (lat, lon)
-    except Exception:
+        return extract_coords_from_details_html(r.text)
+    except Exception as e:
+        print("[WARN] Не удалось достать координаты из Details:", e)
         return None
-    return None
 
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
     type_re = re.compile(TYPE_REGEX, re.IGNORECASE) if TYPE_REGEX else None
@@ -241,33 +253,24 @@ def make_key(inc: Dict[str, str]) -> str:
     today = dt.date.today().isoformat()
     return f"{today}:{inc['no']}:{inc['time']}:{inc['type']}"
 
-def google_maps_link(lat: Optional[float], lon: Optional[float], q: str) -> str:
-    if lat is not None and lon is not None:
-        return f"https://maps.google.com/?q={lat},{lon}"
-    q_enc = urllib.parse.quote(q)
-    return f"https://maps.google.com/?q={q_enc}"
-
 def format_message(inc: Dict[str, str], lat: Optional[float], lon: Optional[float]) -> str:
+    parts = [
+        f"🚨 ДТП {inc['time']}",
+        f"{inc['type']}",
+        f"📍 {inc['location']} — {inc['locdesc']}",
+        f"🏷️ {inc['area']}",
+    ]
     if lat is not None and lon is not None:
-        # строим маршрут по координатам
-        link = f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=driving"
+        link = f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving"
+        parts.append(f"🗺️ {link}")
     else:
-        # запасной вариант, если координат нет
-        link = f"https://www.google.com/maps/search/?api=1&query={inc['location']} {inc['locdesc']} {inc['area']}"
-    return (
-        f"🚨 ДТП {inc['time']}\n"
-        f"{inc['type']}\n"
-        f"📍 {inc['location']} — {inc['locdesc']}\n"
-        f"🏷️ {inc['area']}\n"
-        f"🗺️ {link}"
-    )
+        parts.append("🗺️ Координаты недоступны")
+    return "\n".join(parts)
 
-def main() -> None:
-    print("[INFO] CHP notifier v3 started. Center:", COMM_CENTER, "| Interval:", POLL_INTERVAL, "sec")
+def main_loop() -> None:
     seen = load_seen()
     last_day = dt.date.today()
     session = requests.Session()
-
     while True:
         try:
             if dt.date.today() != last_day:
@@ -286,7 +289,7 @@ def main() -> None:
                     continue
 
                 lat = lon = None
-                if FETCH_COORDS and inc.get("details_href"):
+                if inc.get("details_href"):
                     coords = try_fetch_latlon_from_details(session, inc["details_href"])
                     if coords:
                         lat, lon = coords
@@ -295,6 +298,7 @@ def main() -> None:
                 send_telegram(message)
                 seen[key] = dt.datetime.utcnow().isoformat()
                 new_count += 1
+
             if new_count:
                 save_seen(seen)
 
@@ -305,6 +309,10 @@ def main() -> None:
         except Exception as e:
             print("[ERR] loop error:", e)
         time.sleep(POLL_INTERVAL)
+
+def main():
+    print(f"[INFO] CHP notifier v4 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
+    main_loop()
 
 if __name__ == "__main__":
     main()
