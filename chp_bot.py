@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier (v5.6, location+count only)
-- Выбирает Communications Center и парсит таблицу
-- По каждой строке делает postback "Details", достаёт координаты и ПОЛНЫЙ блок Detail Information
-- Сообщение содержит:
-  Шапка → (опционально) Расположение/Машины → Маршрут (URL) → Detail Information (blockquote)
-  * Расположение: только "правая обочина" или "CD" или "съезд"
-  * Машины: число (по X VEH / SOLO / VS)
-  * Если ни расположения, ни числа — секция не выводится вообще
+CHP Traffic -> Telegram notifier (v6.0, edit-on-update + close mark)
+- Один инцидент = одно сообщение. При изменениях редактируем старое сообщение.
+- Когда инцидент исчезает из таблицы N циклов подряд — считаем закрытым и дописываем "❗️ Закрыто CHP".
+- Detail Information "сжимаем" до "HH:MM AM/PM: текст".
+- Карта — прямая ссылка (URL).
 """
 
 import os
@@ -16,6 +13,7 @@ import re
 import time
 import json
 import html
+import hashlib
 import datetime as dt
 from typing import List, Dict, Optional, Tuple
 
@@ -36,7 +34,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # добавь Hit & Run так: TYPE_REGEX=(Collision|Hit\s*(?:&|and)\s*Run)
-TYPE_REGEX = os.getenv("TYPE_REGEX", r"Collision")
+TYPE_REGEX = os.getenv("TYPE_REGEX", r"(Collision|Hit\s*(?:&|and)\s*Run)")
 AREA_REGEX = os.getenv("AREA_REGEX", r"")
 LOCATION_REGEX = os.getenv("LOCATION_REGEX", r"")
 
@@ -44,41 +42,68 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 MAX_DETAIL_CHARS = int(os.getenv("MAX_DETAIL_CHARS", "2500"))
 
+# сколько пропусков подряд считать закрытием (чтобы не закрывать из-за кратковременного глюка)
+MISSES_TO_CLOSE = int(os.getenv("MISSES_TO_CLOSE", "2"))
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
 }
 
 # ---------- Telegram ----------
-def send_telegram(text: str) -> None:
-    """Отправка сообщения с parse_mode=HTML (без инлайн-кнопок)."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+def tg_send(text: str, chat_id: Optional[str] = None) -> Optional[int]:
+    chat_id = (chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_TOKEN or not chat_id:
         print("[WARN] TELEGRAM_TOKEN/CHAT_ID не заданы. Не отправляю:\n", text)
-        return
+        return None
     api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
         "parse_mode": "HTML",
     }
     r = requests.post(api, data=payload, timeout=20)
     if r.status_code != 200:
-        print("[ERR] Telegram API:", r.status_code, r.text[:400])
+        print("[ERR] Telegram send:", r.status_code, r.text[:400])
+        return None
+    data = r.json()
+    try:
+        return int(data["result"]["message_id"])
+    except Exception:
+        return None
 
-# ---------- хранение seen ----------
-def load_seen() -> Dict[str, str]:
+def tg_edit(message_id: int, text: str, chat_id: Optional[str] = None) -> bool:
+    chat_id = (chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_TOKEN or not chat_id or not message_id:
+        return False
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True,
+        "parse_mode": "HTML",
+    }
+    r = requests.post(api, data=payload, timeout=20)
+    if r.status_code != 200:
+        print("[ERR] Telegram edit:", r.status_code, r.text[:400])
+        return False
+    return True
+
+# ---------- хранилище состояния ----------
+def load_state() -> Dict[str, dict]:
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
     except Exception:
-        return {}
+        pass
+    return {}
 
-def save_seen(seen: Dict[str, str]) -> None:
-    if len(seen) > 5000:
-        keys = list(seen.keys())[-2000:]
-        seen = {k: seen[k] for k in keys}
+def save_state(state: Dict[str, dict]) -> None:
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen, f, ensure_ascii=False, indent=2)
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 # ---------- ASP.NET helpers ----------
 def extract_form_state(soup: BeautifulSoup) -> Tuple[str, Dict[str, str]]:
@@ -113,7 +138,7 @@ def extract_form_state(soup: BeautifulSoup) -> Tuple[str, Dict[str, str]]:
         payload[name] = ta.get_text()
     return action, payload
 
-def choose_communications_center(session: requests.Session) -> str:
+def choose_communications_center(session: requests.Session, center_name: str) -> str:
     r = session.get(BASE_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -129,14 +154,14 @@ def choose_communications_center(session: requests.Session) -> str:
     comm_select = next((s for s in selects if looks_like_comm_select(s)), selects[0])
 
     option_value = None
-    target = COMM_CENTER.strip().lower()
+    target = center_name.strip().lower()
     for opt in comm_select.find_all("option"):
         label = opt.get_text(strip=True).lower()
         if target in label:
             option_value = opt.get("value") or opt.get_text(strip=True)
             break
     if not option_value:
-        raise RuntimeError(f"Не нашёл Communications Center '{COMM_CENTER}'")
+        raise RuntimeError(f"Не нашёл Communications Center '{center_name}'")
     payload[comm_select.get("name")] = option_value
 
     # submit
@@ -187,7 +212,7 @@ def parse_incidents_with_postbacks(html: str) -> Tuple[BeautifulSoup, List[Dict[
             if m:
                 postback = {"target": m.group(1), "argument": m.group(2)}
         incidents.append({
-            "no": cols[1].get_text(strip=True),
+            "no": cols[1].get_text(strip=True),         # это наш incident_id
             "time": cols[2].get_text(strip=True),
             "type": cols[3].get_text(strip=True),
             "location": cols[4].get_text(strip=True),
@@ -217,7 +242,7 @@ def extract_coords_from_details_html(soup: BeautifulSoup) -> Optional[Tuple[floa
     return None
 
 def extract_detail_lines(soup: BeautifulSoup) -> Optional[List[str]]:
-    """Сырые строки блока 'Detail Information'."""
+    """Сырые строки блока 'Detail Information' (между заголовком и 'Unit Information'/'Close')."""
     flat = soup.get_text("\n", strip=True)
 
     m_start = re.search(r"(?im)^Detail Information$", flat)
@@ -236,11 +261,46 @@ def extract_detail_lines(soup: BeautifulSoup) -> Optional[List[str]]:
             lines.append(s)
     return lines or None
 
-def extract_detail_information_block_from_lines(lines: List[str]) -> str:
-    """
-    Делаем аккуратные строки "8:29 AM: текст" и собираем цитату (<blockquote> с \n).
-    Без <br>, чтобы Telegram не ругался.
-    """
+# --- Сгущение Detail Information до "HH:MM AM/PM: текст" ---
+TIME_RE = re.compile(r'^\d{1,2}:\d{2}\s*(?:AM|PM)$', re.IGNORECASE)
+FOOTER_PATTERNS = [
+    r'^Click on Details for additional information\.',
+    r'^Your screen will refresh in \d+ seconds\.$',
+    r'^Contact Us$', r'^CHP Home Page$', r'^CHP Mobile Traffic$', r'^\|$'
+]
+FOOTER_RE = re.compile("|".join(FOOTER_PATTERNS), re.IGNORECASE)
+
+def condense_detail_lines(lines: List[str]) -> List[str]:
+    """Из последовательностей (время, номер, [N] текст) делаем 'время: текст'. Футер отбрасываем."""
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line or FOOTER_RE.search(line):
+            i += 1
+            continue
+        if TIME_RE.match(line):
+            t = line
+            j = i + 1
+            if j < len(lines) and re.match(r'^\d+$', lines[j].strip()):
+                j += 1
+            desc = None
+            if j < len(lines):
+                cand = lines[j].strip()
+                cand = re.sub(r'^\[\d+\]\s*', '', cand)  # убираем [4]
+                if cand and not FOOTER_RE.search(cand):
+                    desc = cand
+            if desc:
+                out.append(f"{t}: {desc}")
+                i = j + 1
+                continue
+            i += 1
+            continue
+        i += 1
+    return out
+
+def details_block_from_lines(lines: List[str]) -> str:
+    """В HTML-цитату (<blockquote>) с переносами \\n (без <br>)."""
     clean = condense_detail_lines(lines)
     if not clean:
         return "<blockquote>No details</blockquote>"
@@ -253,7 +313,6 @@ def extract_detail_information_block_from_lines(lines: List[str]) -> str:
             acc += ("\n" if acc else "") + "… (truncated)"
             break
         acc = candidate
-
     return f"<blockquote>{acc}</blockquote>"
 
 def fetch_details_by_postback(session: requests.Session, action_url: str, base_payload: Dict[str, str],
@@ -268,113 +327,38 @@ def fetch_details_by_postback(session: requests.Session, action_url: str, base_p
     soup = BeautifulSoup(r.text, "html.parser")
     coords = extract_coords_from_details_html(soup)
     lines = extract_detail_lines(soup)
-    details_block_html = extract_detail_information_block_from_lines(lines) if lines else None
+    details_block_html = details_block_from_lines(lines) if lines else None
     return coords, details_block_html, lines
 
 # ---------- ВЫЧИСЛЕНИЕ: расположение + число машин ----------
 BARRIER_WORDS = {"BARRIER", "GUARDRAIL", "FENCE", "DEBRIS", "ANIMAL", "DEER", "TREE", "POLE", "SIGN"}
 
 def parse_location_and_count(detail_lines: Optional[List[str]]) -> Tuple[Optional[str], Optional[int]]:
-    """
-    Возвращает (location_label, veh_count)
-      location_label ∈ {"правая обочина", "CD", "съезд"} или None
-      veh_count ∈ {1,2,...} или None
-    """
     if not detail_lines:
         return None, None
-
     text_up = " ".join(detail_lines).upper()
 
-    # --- РАСПОЛОЖЕНИЕ ---
-    # правая обочина
     loc = None
     if re.search(r"\bRS\b|\bRIGHT SHOULDER\b", text_up):
         loc = "правая обочина"
-    # CD (center divider)
     if re.search(r"\bCD\b|\bCENTER DIVIDER\b", text_up):
         loc = "CD"
-    # съезд (on/off ramp, exit)
     if re.search(r"\bON[- ]?RAMP\b|\bOFF[- ]?RAMP\b|\bEXIT\b", text_up):
         loc = "съезд"
 
-    # --- КОЛ-ВО МАШИН ---
-    # X VEH / SOLO VEH
     nums = [int(n) for n in re.findall(r"\b(\d{1,2})\s*VEH\b", text_up)]
     veh_count = max(nums) if nums else None
     if veh_count is None and "SOLO VEH" in text_up:
         veh_count = 1
 
-    # "XXX VS YYY" — считаем как 2 ТС, если обе стороны не из BARRIER_WORDS
     if veh_count is None and re.search(r"\bVS\b", text_up):
-        # возьмём пару первых слов по шаблону "... VS ..."
         m = re.search(r"\b([A-Z0-9/&\- ]{2,30}?)\s+VS\s+([A-Z0-9/&\- ]{2,30}?)\b", text_up)
         if m:
             left = m.group(1).strip().split()[0]
             right = m.group(2).strip().split()[0]
             if left not in BARRIER_WORDS and right not in BARRIER_WORDS:
                 veh_count = 2
-
     return loc, veh_count
-
-# --- Сгущение Detail Information до "HH:MM AM/PM: текст" ---
-TIME_RE = re.compile(r'^\d{1,2}:\d{2}\s*(?:AM|PM)$', re.IGNORECASE)
-FOOTER_PATTERNS = [
-    r'^Click on Details for additional information\.', r'^Your screen will refresh in \d+ seconds\.$',
-    r'^Contact Us$', r'^CHP Home Page$', r'^CHP Mobile Traffic$', r'^\|$'
-]
-FOOTER_RE = re.compile("|".join(FOOTER_PATTERNS), re.IGNORECASE)
-
-def condense_detail_lines(lines: list[str]) -> list[str]:
-    """
-    Из последовательностей вида:
-        8:29 AM
-        2
-        [4] 2ND VEH BLK SD BLKG #3
-    делаем строки:
-        8:29 AM: 2ND VEH BLK SD BLKG #3
-    Футер/мусор отбрасываем.
-    """
-    out = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        # пропускаем футер/разделители
-        if not line or FOOTER_RE.search(line):
-            i += 1
-            continue
-
-        # если это строка времени — собираем запись
-        if TIME_RE.match(line):
-            t = line
-            j = i + 1
-
-            # пропустить возможный порядковый номер ("1", "2", ...)
-            if j < len(lines) and re.match(r'^\d+$', lines[j].strip()):
-                j += 1
-
-            # взять первую содержательную строку после времени
-            desc = None
-            if j < len(lines):
-                cand = lines[j].strip()
-                # удалить префикс вида "[4] "
-                cand = re.sub(r'^\[\d+\]\s*', '', cand)
-                # игнорировать футер и пустое
-                if cand and not FOOTER_RE.search(cand):
-                    desc = cand
-
-            if desc:
-                out.append(f"{t}: {desc}")
-                i = j + 1
-                continue
-            else:
-                # нет текста — просто пропускаем время
-                i += 1
-                continue
-
-        # если это не время — пропустить
-        i += 1
-
-    return out
 
 # ---------- фильтры/формат ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -390,33 +374,29 @@ def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if ok: result.append(x)
     return result
 
-def make_key(inc: Dict[str, str]) -> str:
-    today = dt.date.today().isoformat()
-    return f"{today}:{inc['no']}:{inc['time']}:{inc['type']}"
-
-def format_message(inc: Dict[str, str],
-                   latlon: Optional[Tuple[float, float]],
-                   details_block: Optional[str],
-                   loc_label: Optional[str],
-                   veh_count: Optional[int]) -> str:
-    # Шапка
+def make_text(inc: Dict[str, str],
+              latlon: Optional[Tuple[float, float]],
+              details_block: Optional[str],
+              loc_label: Optional[str],
+              veh_count: Optional[int],
+              closed: bool = False) -> str:
+    # первая строка — время + area
     title = (
-        f"🚨 ДТП {html.escape(inc['time'])}\n"
-        f"{html.escape(inc['type'])}\n"
-        f"📍 {html.escape(inc['location'])} — {html.escape(inc['locdesc'])}\n"
-        f"🏷️ {html.escape(inc['area'])}"
+        f"⏰ {html.escape(inc['time'])} | {html.escape(inc['area'])}\n"
+        f"{html.escape(inc['type'])}\n\n"
+        f"📍 {html.escape(inc['location'])} — {html.escape(inc['locdesc'])}"
     )
 
-    # Раздел «Расположение/Машины» — только если есть что сказать
-    lines = []
+    # блок Расположение/Машины
+    bits = []
     if loc_label:
-        lines.append(loc_label)
+        bits.append(loc_label)
     if veh_count is not None:
-        lines.append(f"{veh_count} ТС")
-    if lines:
-        title += "\n\n<b>📌 Расположение / Машины:</b>\n" + ", ".join(lines)
+        bits.append(f"{veh_count} ТС")
+    if bits:
+        title += "\n\n<b>📌 Расположение / Машины:</b>\n" + ", ".join(bits)
 
-    # Маршрут
+    # маршрут
     if latlon:
         lat, lon = latlon
         url = f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving"
@@ -424,36 +404,40 @@ def format_message(inc: Dict[str, str],
     else:
         title += "\n\n<b>🗺️ Маршрут:</b>\nКоординаты недоступны"
 
-    # Полный Detail Information
+    # details
     if details_block:
         title += f"\n\n<b>📝 Detail Information:</b>\n{details_block}"
 
+    # закрытие
+    if closed:
+        title += "\n\n<b>❗️ Закрыто CHP</b>"
+
     return title
+
+def signature_for_update(inc: Dict[str, str], details_block: Optional[str]) -> str:
+    """Подпись содержимого, чтобы понять, изменилось ли что-то (тип/детали)."""
+    base = (inc.get("type","") + "||" + (details_block or "")).encode("utf-8", "ignore")
+    return hashlib.sha1(base).hexdigest()
 
 # ---------- главный цикл ----------
 def main() -> None:
-    print(f"[INFO] CHP notifier v5.6 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
-    seen = load_seen()
-    last_day = dt.date.today()
+    print(f"[INFO] CHP notifier v6.0 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
+    state = load_state()
     session = requests.Session()
 
     while True:
+        cycle_seen_ids = set()
         try:
-            if dt.date.today() != last_day:
-                seen = {}; last_day = dt.date.today(); save_seen(seen)
-
-            html = choose_communications_center(session)
+            html = choose_communications_center(session, COMM_CENTER)
             soup, incidents = parse_incidents_with_postbacks(html)
             action_url, base_payload = extract_form_state(soup)
-
             filtered = filter_collisions(incidents)
 
-            new_count = 0
             for inc in filtered:
-                key = make_key(inc)
-                if key in seen:
-                    continue
+                inc_id = inc["no"]  # уникальный ID строки на сегодня
+                cycle_seen_ids.add(inc_id)
 
+                # тянем детали
                 latlon = None
                 details_block = None
                 detail_lines = None
@@ -464,19 +448,59 @@ def main() -> None:
                     )
 
                 loc_label, veh_count = parse_location_and_count(detail_lines)
-                text = format_message(inc, latlon, details_block, loc_label, veh_count)
-                send_telegram(text)
-                seen[key] = dt.datetime.utcnow().isoformat()
-                new_count += 1
+                text = make_text(inc, latlon, details_block, loc_label, veh_count, closed=False)
+                sig = signature_for_update(inc, details_block)
 
-            if new_count:
-                save_seen(seen)
+                st = state.get(inc_id)
+                if st and st.get("message_id"):
+                    # было ли изменение?
+                    if st.get("last_sig") != sig or st.get("closed", False):
+                        ok = tg_edit(st["message_id"], text, chat_id=st.get("chat_id") or TELEGRAM_CHAT_ID)
+                        if ok:
+                            st["last_sig"] = sig
+                            st["last_text"] = text
+                            st["closed"] = False
+                    st["misses"] = 0
+                    st["last_seen"] = dt.datetime.utcnow().isoformat()
+                else:
+                    # отправляем новое
+                    mid = tg_send(text, chat_id=TELEGRAM_CHAT_ID)
+                    state[inc_id] = {
+                        "message_id": mid,
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "last_sig": sig,
+                        "last_text": text,
+                        "closed": False,
+                        "misses": 0,
+                        "first_seen": dt.datetime.utcnow().isoformat(),
+                        "last_seen": dt.datetime.utcnow().isoformat(),
+                    }
 
-            print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {COMM_CENTER}: rows={len(incidents)}, matched={len(filtered)}, new={new_count}")
+            # обработка "исчезнувших" инцидентов — возможно закрыты
+            for inc_id, st in list(state.items()):
+                # учитываем только наши сегодняшние инциденты (формат ID у CHP обнуляется каждый день)
+                if inc_id not in cycle_seen_ids and isinstance(st, dict):
+                    st["misses"] = st.get("misses", 0) + 1
+                    # если уже закрыт — игнорим
+                    if st.get("closed"):
+                        continue
+                    if st["misses"] >= MISSES_TO_CLOSE and st.get("message_id"):
+                        new_text = (st.get("last_text") or "") + "\n\n<b>❗️ Закрыто CHP</b>"
+                        ok = tg_edit(st["message_id"], new_text, chat_id=st.get("chat_id") or TELEGRAM_CHAT_ID)
+                        if ok:
+                            st["last_text"] = new_text
+                            st["closed"] = True
+
+            save_state(state)
+
+            print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {COMM_CENTER}: rows={len(incidents)}, matched={len(filtered)}, tracked={len(state)}")
+
         except KeyboardInterrupt:
-            print("\n[INFO] Stopped by user."); break
+            print("\n[INFO] Stopped by user.")
+            break
         except Exception as e:
             print("[ERR] loop error:", e)
+
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
