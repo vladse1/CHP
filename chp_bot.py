@@ -237,15 +237,23 @@ def extract_detail_lines(soup: BeautifulSoup) -> Optional[List[str]]:
     return lines or None
 
 def extract_detail_information_block_from_lines(lines: List[str]) -> str:
-    """HTML-цитата (<blockquote>) из списка строк. Без <br>, переносы — \n."""
+    """
+    Делаем аккуратные строки "8:29 AM: текст" и собираем цитату (<blockquote> с \n).
+    Без <br>, чтобы Telegram не ругался.
+    """
+    clean = condense_detail_lines(lines)
+    if not clean:
+        return "<blockquote>No details</blockquote>"
+
     acc = ""
-    for ln in lines:
+    for ln in clean:
         piece = html.escape(ln)
         candidate = acc + ("" if not acc else "\n") + piece
         if len(candidate) > MAX_DETAIL_CHARS:
             acc += ("\n" if acc else "") + "… (truncated)"
             break
         acc = candidate
+
     return f"<blockquote>{acc}</blockquote>"
 
 def fetch_details_by_postback(session: requests.Session, action_url: str, base_payload: Dict[str, str],
@@ -307,6 +315,66 @@ def parse_location_and_count(detail_lines: Optional[List[str]]) -> Tuple[Optiona
                 veh_count = 2
 
     return loc, veh_count
+
+# --- Сгущение Detail Information до "HH:MM AM/PM: текст" ---
+TIME_RE = re.compile(r'^\d{1,2}:\d{2}\s*(?:AM|PM)$', re.IGNORECASE)
+FOOTER_PATTERNS = [
+    r'^Click on Details for additional information\.', r'^Your screen will refresh in \d+ seconds\.$',
+    r'^Contact Us$', r'^CHP Home Page$', r'^CHP Mobile Traffic$', r'^\|$'
+]
+FOOTER_RE = re.compile("|".join(FOOTER_PATTERNS), re.IGNORECASE)
+
+def condense_detail_lines(lines: list[str]) -> list[str]:
+    """
+    Из последовательностей вида:
+        8:29 AM
+        2
+        [4] 2ND VEH BLK SD BLKG #3
+    делаем строки:
+        8:29 AM: 2ND VEH BLK SD BLKG #3
+    Футер/мусор отбрасываем.
+    """
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # пропускаем футер/разделители
+        if not line or FOOTER_RE.search(line):
+            i += 1
+            continue
+
+        # если это строка времени — собираем запись
+        if TIME_RE.match(line):
+            t = line
+            j = i + 1
+
+            # пропустить возможный порядковый номер ("1", "2", ...)
+            if j < len(lines) and re.match(r'^\d+$', lines[j].strip()):
+                j += 1
+
+            # взять первую содержательную строку после времени
+            desc = None
+            if j < len(lines):
+                cand = lines[j].strip()
+                # удалить префикс вида "[4] "
+                cand = re.sub(r'^\[\d+\]\s*', '', cand)
+                # игнорировать футер и пустое
+                if cand and not FOOTER_RE.search(cand):
+                    desc = cand
+
+            if desc:
+                out.append(f"{t}: {desc}")
+                i = j + 1
+                continue
+            else:
+                # нет текста — просто пропускаем время
+                i += 1
+                continue
+
+        # если это не время — пропустить
+        i += 1
+
+    return out
 
 # ---------- фильтры/формат ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
