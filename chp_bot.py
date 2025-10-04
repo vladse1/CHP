@@ -1,45 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier + (optional) Analytics (v8.0)
 
-========================  README / QUICK START  ========================
-Эта версия добавляет:
-  • Сетевой JITTER + EXPONENTIAL BACKOFF для всех запросов (GET/POST)
-  • Динамическую обрезку текста, чтобы сообщения всегда < 4096 символов
-  • Опциональную аналитику в PostgreSQL (Neon/Supabase)
-  • «Человеческое» краткое резюме БЕЗ кодов (1185/1141/97/ENRT) и БЕЗ слова «блокировки»
-  • Сохранение «blocked» в БД (для анализа), но не выводим это в кратком описании
-
------------------------------------------------------------------------
-Как включить аналитику (Neon / Supabase) — 5 шагов:
-1) Создай бесплатный Postgres:
-   • Neon:   https://neon.tech (Create Project → Branch → Database)
-   • Supabase: https://supabase.com (New Project → Database)
-2) Скопируй DATABASE_URL (postgres://USER:PASSWORD@HOST:PORT/DB)
-3) В панели Render/Cloud Run положи ENV:
-   - ANALYTICS_ENABLED=true
-   - DATABASE_URL=postgres://USER:PASSWORD@HOST:PORT/DBNAME
-   - TZ=America/Los_Angeles
 4) Запусти бота — при старте увидишь "DB connected" и авто-создание таблицы "incidents".
 5) Проверка: посмотри логи о INSERT/UPDATE или выполни SELECT в консоли БД.
-
-Режим без БД:
-- Если ANALYTICS_ENABLED=false или DATABASE_URL пуст/недоступен, бот логирует WARNING
-  и работает как обычно (просто без записи аналитики).
-
-ENV пример (.env):
-  TELEGRAM_TOKEN=123:ABC
-  TELEGRAM_CHAT_ID=-1001234567890
-  COMM_CENTER=Inland
-  TYPE_REGEX=(Collision|Hit\s*(?:&|and)\s*Run)
-  POLL_INTERVAL=30
-  MISSES_TO_CLOSE=2
-  MAX_DETAIL_CHARS=2500
-  TZ=America/Los_Angeles
-  LOG_LEVEL=INFO
-  ANALYTICS_ENABLED=true
-  DATABASE_URL=postgres://USER:PASSWORD@HOST:PORT/DBNAME
 
 SQL для аналитики:
 -- Пиковые часы × дни недели
@@ -560,64 +524,80 @@ def parse_rich_facts(detail_lines: Optional[List[str]]) -> dict:
 
     return facts
 
-def human_summary_from_facts(facts: dict) -> Optional[str]:
+# ---------- improved human summary (no codes, no “blocked”) ----------
+def human_summary_from_facts(facts: dict) -> tuple[str, set]:
     """
-    Сформировать ОДНУ короткую человеческую фразу без кодов и БЕЗ упоминания «блокировки».
-    Примеры:
-      "2 машины на правой обочине, обе на ходу, в 9:30 вызвали эвакуатор"
-      "фура и легковая на съезде, офицеры CHP на месте"
+    Возвращает (summary_text, consumed_keys)
+    consumed_keys — какие элементы уже «съедены» резюме (чтобы не повторять в маркерах).
     """
-    parts = []
+    consumed = set()
+    bits = []
 
-    # Количество машин
+    # 1) Сколько и какие ТС
     v = facts.get("vehicles")
-    if v is not None:
-        parts.append(f"{v} маш.")
-    # Типы ТС
-    tags = list(sorted(facts.get("vehicle_tags") or []))
-    if tags:
-        parts.append("есть " + " / ".join(tags))
+    tags = list(sorted(facts.get("vehicle_tags") or []))  # русские: "мотоцикл","фура","грузовик","пикап"
+    veh_phrase = None
+    if v is not None and v > 0:
+        if tags:
+            veh_phrase = f"{v} маш. ({', '.join(tags)})"
+            consumed.update({"vehicles", "vehicle_tags"})
+        else:
+            veh_phrase = f"{v} маш."
+            consumed.add("vehicles")
+    elif tags:
+        veh_phrase = _unique_join(tags, " / ")
+        consumed.add("vehicle_tags")
+    if veh_phrase:
+        bits.append(veh_phrase)
 
-    # Локация
-    loc = facts.get("loc_label")
-    ramp = facts.get("ramp")
-    lane = None
-    if facts.get("lane_nums"):
-        lane = "#" + ",".join(sorted(facts["lane_nums"]))
-    loc_bits = []
-    if loc: loc_bits.append(loc)
-    if ramp: loc_bits.append("съезд" if ramp in ("on-ramp", "off-ramp", "exit") else ramp)
-    if lane: loc_bits.append(f"полоса {lane}")
-    if loc_bits:
-        parts.append(", ".join(loc_bits))
+    # 2) Где именно
+    loc = facts.get("loc_label")  # правая/левая обочина / CD
+    ramp = facts.get("ramp")      # on/off/exit -> "съезд"
+    lane = _compact_lanes(facts.get("lane_nums") or set())
+    where_parts = []
+    if ramp: where_parts.append("съезд")
+    if loc:  where_parts.append(loc)
+    if lane: where_parts.append(f"полоса {lane}")
+    if where_parts:
+        bits.append(_unique_join(where_parts, ", "))
+        consumed.update({"loc_label", "ramp", "lane_nums"})
 
-    # Driveable
+    # 3) Ходовость
     if facts.get("driveable") is True:
-        parts.append("обе на ходу" if (v and v >= 2) else "на ходу")
+        bits.append("на ходу")
+        consumed.add("driveable")
     elif facts.get("driveable") is False:
-        parts.append("не на ходу")
+        bits.append("не на ходу")
+        consumed.add("driveable")
 
-    # Службы
-    if facts.get("chp_on"):
-        parts.append("офицеры CHP на месте")
-    elif facts.get("chp_enrt"):
-        parts.append("офицеры CHP в пути")
-    if facts.get("fire_on"):
-        parts.append("медики/пожарные на месте")
-
-    # Tow
+    # 4) Самое важное из служб (кратко, без кодов)
+    # — эвакуатор приоритетнее, затем CHP, затем медики/пожарные
+    tmark = (facts.get("last_time_hint") or "").lower()
     tow = facts.get("tow")
-    tmark = facts.get("last_time_hint")
     if tow == "requested":
-        parts.append(f"вызвали эвакуатор" + (f" в {tmark.lower()}" if tmark else ""))
+        bits.append("эвакуатор вызван" + (f" ({tmark})" if tmark else ""))
+        consumed.add("tow")
     elif tow == "enroute":
-        parts.append("эвакуатор в пути" + (f" ({tmark.lower()})" if tmark else ""))
+        bits.append("эвакуатор в пути" + (f" ({tmark})" if tmark else ""))
+        consumed.add("tow")
     elif tow == "on_scene":
-        parts.append("эвакуатор на месте" + (f" ({tmark.lower()})" if tmark else ""))
+        bits.append("эвакуатор на месте" + (f" ({tmark})" if tmark else ""))
+        consumed.add("tow")
 
-    if not parts:
-        return None
-    return ", ".join(parts)
+    if facts.get("chp_on"):
+        bits.append("офицеры CHP на месте")
+        consumed.update({"chp_on", "chp_enrt"})
+    elif facts.get("chp_enrt"):
+        bits.append("офицеры CHP в пути")
+        consumed.update({"chp_enrt"})
+
+    if facts.get("fire_on"):
+        bits.append("медики/пожарные на месте")
+        consumed.add("fire_on")
+
+    # итого
+    summary = _unique_join(bits, ", ")
+    return (summary, consumed)
 
 # ---------- filters ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -633,13 +613,47 @@ def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if ok: result.append(x)
     return result
 
-# ---------- message build (with dynamic trim) ----------
+# --- helpers for clean phrasing & no-dup ---
+
+def _compact_lanes(lanes: set) -> str:
+    """#1,#2,#3 -> '#1–#3'; иначе просто '#1,#4'."""
+    if not lanes:
+        return ""
+    nums = sorted(int(x) for x in lanes if x.isdigit())
+    if not nums:
+        return ""
+    spans = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        spans.append((start, prev))
+        start = prev = n
+    spans.append((start, prev))
+    # форматируем
+    parts = []
+    for a, b in spans:
+        parts.append(f"#{a}" if a == b else f"#{a}–#{b}")
+    return ", ".join(parts)
+
+def _unique_join(parts: list, sep: str = ", ") -> str:
+    seen, out = set(), []
+    for p in parts:
+        p = p.strip()
+        if not p or p in seen:
+            continue
+        seen.add(p); out.append(p)
+    return sep.join(out)
+
+# ---------- revamped make_text: summary first, markers dedup ----------
 def make_text(inc: Dict[str, str],
               latlon: Optional[Tuple[float, float]],
               details_lines_clean: List[str],
               facts: dict,
               closed: bool = False) -> str:
-    # эмодзи по типу – во второй строке
+
+    # иконка по типу
     icon = ""
     if "Collision" in inc['type']:
         icon = "🚨"
@@ -648,52 +662,66 @@ def make_text(inc: Dict[str, str],
 
     # шапка
     head = (
-        f"⏱ {html.escape(inc['time'])} | 🏙 {html.escape(inc['area'])}\n"
+        f"⏳ {html.escape(inc['time'])} | 🏷️ {html.escape(inc['area'])}\n"
         f"{icon} {html.escape(inc['type'])}\n\n"
         f"📍 {html.escape(inc['location'])} — {html.escape(inc['locdesc'])}"
     )
 
-    # человеческая краткая фраза
-    summary_line = human_summary_from_facts(facts)
+    # 1) человеческое резюме + set полей, которые уже сказаны
+    summary_line, consumed = human_summary_from_facts(facts)
 
-    # компактные маркеры (без «блокировки» и без кодов)
-    lines = []
-    if summary_line:
-        lines.append(summary_line)
+    # 2) компактные маркеры без повторов и БЕЗ «блокировок»/кодов
+    markers = []
 
+    # — Место (если не использовано в резюме)
     loc_bits = []
-    if facts.get("loc_label"): loc_bits.append(facts["loc_label"])
-    if facts.get("ramp"): loc_bits.append("съезд")
-    if facts.get("lane_nums"): loc_bits.append("полоса #" + ",".join(sorted(facts["lane_nums"])))
-    if facts.get("hov"): loc_bits.append("HOV")
+    if "loc_label" not in consumed and facts.get("loc_label"):
+        loc_bits.append(facts["loc_label"])
+    if "ramp" not in consumed and facts.get("ramp"):
+        loc_bits.append("съезд")
+    if "lane_nums" not in consumed and facts.get("lane_nums"):
+        lane = _compact_lanes(facts["lane_nums"])
+        if lane:
+            loc_bits.append(f"полоса {lane}")
+    if facts.get("hov"):
+        loc_bits.append("HOV")
     if loc_bits:
-        lines.append(" · ".join(loc_bits))
+        markers.append(_unique_join(loc_bits, " · "))
 
+    # — Машины (если не использовано в резюме)
     veh_bits = []
-    v = facts.get("vehicles")
-    if v is not None: veh_bits.append(f"{v} ТС")
-    tags = facts.get("vehicle_tags") or set()
-    if tags:
-        veh_bits.append(", ".join(sorted(tags)))
+    if "vehicles" not in consumed and facts.get("vehicles") is not None:
+        veh_bits.append(f"{facts['vehicles']} ТС")
+    if "vehicle_tags" not in consumed and facts.get("vehicle_tags"):
+        veh_bits.append(", ".join(sorted(facts["vehicle_tags"])))
     if veh_bits:
-        lines.append(" / ".join(veh_bits))
+        markers.append(" / ".join(veh_bits))
 
+    # — Службы (без кодов; не повторять то, что уже в резюме)
     st_bits = []
-    if facts.get("chp_on"): st_bits.append("офицеры CHP на месте")
-    elif facts.get("chp_enrt"): st_bits.append("офицеры CHP в пути")
-    if facts.get("fire_on"): st_bits.append("медики/пожарные")
-    tow = facts.get("tow")
-    if tow == "requested": st_bits.append("эвакуатор вызван")
-    elif tow == "enroute": st_bits.append("эвакуатор в пути")
-    elif tow == "on_scene": st_bits.append("эвакуатор на месте")
-    if facts.get("driveable") is True: st_bits.append("на ходу")
-    elif facts.get("driveable") is False: st_bits.append("не на ходу")
+    if "chp_on" not in consumed and facts.get("chp_on"):
+        st_bits.append("офицеры CHP на месте")
+    elif "chp_enrt" not in consumed and facts.get("chp_enrt"):
+        st_bits.append("офицеры CHP в пути")
+    if "fire_on" not in consumed and facts.get("fire_on"):
+        st_bits.append("медики/пожарные")
+    if "tow" not in consumed and facts.get("tow"):
+        if facts["tow"] == "requested": st_bits.append("эвакуатор вызван")
+        elif facts["tow"] == "enroute": st_bits.append("эвакуатор в пути")
+        elif facts["tow"] == "on_scene": st_bits.append("эвакуатор на месте")
+    if "driveable" not in consumed:
+        if facts.get("driveable") is True:  st_bits.append("на ходу")
+        elif facts.get("driveable") is False: st_bits.append("не на ходу")
     if st_bits:
-        lines.append(", ".join(st_bits))
+        markers.append(_unique_join(st_bits, ", "))
 
-    facts_block = ""
-    if lines:
-        facts_block = "\n\n<b>📌 Расположение / Машины:</b>\n" + " | ".join(lines)
+    # Сборка фактового блока
+    facts_block_lines = []
+    if summary_line:
+        facts_block_lines.append(summary_line)
+    if markers:
+        facts_block_lines.append(" | ".join(markers))
+    facts_block = "\n\n<b>📌 Расположение / Машины:</b>\n" + "\n".join(facts_block_lines) if facts_block_lines else ""
 
     # маршрут
     if latlon:
@@ -703,11 +731,9 @@ def make_text(inc: Dict[str, str],
     else:
         route_block = "\n\n<b>🗺️ Маршрут:</b>\nКоординаты недоступны"
 
-    # детали как blockquote — динамически урезаем, чтобы влезло в 4096
-    # сначала сформируем «скелет» без деталей
+    # детали: динамично обрезаем чтобы <= 4096
     skeleton = head + facts_block + route_block
-    # осталось на детали
-    leftover = TG_HARD_LIMIT - safe_len_for_telegram(skeleton) - len("\n\n<b>📝 Detail Information:</b>\n") - (len("\n\n<b>❗️ Инцидент закрыт CHP</b>") if closed else 0)
+    leftover = TG_HARD_LIMIT - len(skeleton) - len("\n\n<b>📝 Detail Information:</b>\n") - (len("\n\n<b>❗️ Инцидент закрыт CHP</b>") if closed else 0)
     cap = max(0, min(MAX_DETAIL_CHARS_BASE, leftover))
     details_block = blockquote_from_lines(details_lines_clean, cap) if cap > 0 else ""
     det_block = f"\n\n<b>📝 Detail Information:</b>\n{details_block}" if details_block else ""
@@ -716,9 +742,8 @@ def make_text(inc: Dict[str, str],
     if closed:
         text += "\n\n<b>❗️ Инцидент закрыт CHP</b>"
 
-    # страховка: если всё равно вдруг > 4096 — режем детали сильней
-    if safe_len_for_telegram(text) > TG_HARD_LIMIT and det_block:
-        # попробуем урезать ещё на 20%
+    # страховка — если вдруг перелезли лимит
+    if len(text) > TG_HARD_LIMIT and det_block:
         shrink = int(cap * 0.8)
         details_block = blockquote_from_lines(details_lines_clean, max(0, shrink))
         det_block = f"\n\n<b>📝 Detail Information:</b>\n{details_block}" if details_block else ""
