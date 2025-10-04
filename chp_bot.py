@@ -380,14 +380,21 @@ def make_text(inc: Dict[str, str],
               loc_label: Optional[str],
               veh_count: Optional[int],
               closed: bool = False) -> str:
-    # первая строка — время + area
+    # выбрать эмодзи по типу
+    icon = ""
+    if "Collision" in inc['type']:
+        icon = "🚨"
+    elif "Hit" in inc['type'] and "Run" in inc['type']:
+        icon = "🚗"
+
+    # первая строка — время и area
     title = (
-        f"⏰ {html.escape(inc['time'])} | {html.escape(inc['area'])}\n"
-        f"{html.escape(inc['type'])}\n\n"
+        f"⏱ {html.escape(inc['time'])} | 🏙 {html.escape(inc['area'])}\n"
+        f"{icon} {html.escape(inc['type'])}\n\n"
         f"📍 {html.escape(inc['location'])} — {html.escape(inc['locdesc'])}"
     )
 
-    # блок Расположение/Машины
+    # расположение / машины
     bits = []
     if loc_label:
         bits.append(loc_label)
@@ -404,13 +411,13 @@ def make_text(inc: Dict[str, str],
     else:
         title += "\n\n<b>🗺️ Маршрут:</b>\nКоординаты недоступны"
 
-    # details
+    # детали
     if details_block:
         title += f"\n\n<b>📝 Detail Information:</b>\n{details_block}"
 
-    # закрытие
+    # закрыто
     if closed:
-        title += "\n\n<b>❗️ Закрыто CHP</b>"
+        title += "\n\n<b>❗️ Инцидент закрыт CHP</b>"
 
     return title
 
