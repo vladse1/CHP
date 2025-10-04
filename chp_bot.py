@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CHP Traffic -> Telegram notifier (v6.0, edit-on-update + close mark)
-- Один инцидент = одно сообщение. При изменениях редактируем старое сообщение.
-- Когда инцидент исчезает из таблицы N циклов подряд — считаем закрытым и дописываем "❗️ Закрыто CHP".
-- Detail Information "сжимаем" до "HH:MM AM/PM: текст".
+CHP Traffic -> Telegram notifier (v6.2 rich-facts)
+- Один инцидент = одно сообщение; при изменениях редактируем (type, details, извлечённые факты).
+- По исчезновению несколько циклов подряд помечаем "❗️ Инцидент закрыт CHP".
+- Detail Information сжимаем до "HH:MM AM/PM: текст".
 - Карта — прямая ссылка (URL).
+- Блок "📌 Расположение / Машины" теперь строится из расширенных фактов:
+  * Сколько ТС (по X VEH/VEHS, SOLO VEH, VS), типы ТС (MC/SEMI/TRK/PK)
+  * Место: правая/левая обочина, CD, съезд (on/off/exit), HOV, полосы #1/#2..., блокировки
+  * Службы: CHP (97/enrt), FIRE/1141, эвакуатор 1185 (req/enrt/97)
+  * Driveable / NOT driveable
 """
 
 import os
@@ -33,7 +38,7 @@ COMM_CENTER = os.getenv("COMM_CENTER", "Inland")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# добавь Hit & Run так: TYPE_REGEX=(Collision|Hit\s*(?:&|and)\s*Run)
+# фильтр типов (коллизии + хит-энд-ран по умолчанию)
 TYPE_REGEX = os.getenv("TYPE_REGEX", r"(Collision|Hit\s*(?:&|and)\s*Run)")
 AREA_REGEX = os.getenv("AREA_REGEX", r"")
 LOCATION_REGEX = os.getenv("LOCATION_REGEX", r"")
@@ -41,8 +46,6 @@ LOCATION_REGEX = os.getenv("LOCATION_REGEX", r"")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 MAX_DETAIL_CHARS = int(os.getenv("MAX_DETAIL_CHARS", "2500"))
-
-# сколько пропусков подряд считать закрытием (чтобы не закрывать из-за кратковременного глюка)
 MISSES_TO_CLOSE = int(os.getenv("MISSES_TO_CLOSE", "2"))
 
 HEADERS = {
@@ -90,7 +93,7 @@ def tg_edit(message_id: int, text: str, chat_id: Optional[str] = None) -> bool:
         return False
     return True
 
-# ---------- хранилище состояния ----------
+# ---------- state (для редактирования) ----------
 def load_state() -> Dict[str, dict]:
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
@@ -212,7 +215,7 @@ def parse_incidents_with_postbacks(html: str) -> Tuple[BeautifulSoup, List[Dict[
             if m:
                 postback = {"target": m.group(1), "argument": m.group(2)}
         incidents.append({
-            "no": cols[1].get_text(strip=True),         # это наш incident_id
+            "no": cols[1].get_text(strip=True),         # уникальный ID строки на сутки
             "time": cols[2].get_text(strip=True),
             "type": cols[3].get_text(strip=True),
             "location": cols[4].get_text(strip=True),
@@ -244,15 +247,12 @@ def extract_coords_from_details_html(soup: BeautifulSoup) -> Optional[Tuple[floa
 def extract_detail_lines(soup: BeautifulSoup) -> Optional[List[str]]:
     """Сырые строки блока 'Detail Information' (между заголовком и 'Unit Information'/'Close')."""
     flat = soup.get_text("\n", strip=True)
-
     m_start = re.search(r"(?im)^Detail Information$", flat)
     if not m_start:
         return None
     start = m_start.end()
-
     m_end = re.search(r"(?im)^(Unit Information|Close)$", flat[start:])
     end = start + (m_end.start() if m_end else len(flat) - start)
-
     block = flat[start:end]
     lines = []
     for raw in block.splitlines():
@@ -271,7 +271,6 @@ FOOTER_PATTERNS = [
 FOOTER_RE = re.compile("|".join(FOOTER_PATTERNS), re.IGNORECASE)
 
 def condense_detail_lines(lines: List[str]) -> List[str]:
-    """Из последовательностей (время, номер, [N] текст) делаем 'время: текст'. Футер отбрасываем."""
     out = []
     i = 0
     while i < len(lines):
@@ -287,7 +286,7 @@ def condense_detail_lines(lines: List[str]) -> List[str]:
             desc = None
             if j < len(lines):
                 cand = lines[j].strip()
-                cand = re.sub(r'^\[\d+\]\s*', '', cand)  # убираем [4]
+                cand = re.sub(r'^\[\d+\]\s*', '', cand)
                 if cand and not FOOTER_RE.search(cand):
                     desc = cand
             if desc:
@@ -300,11 +299,9 @@ def condense_detail_lines(lines: List[str]) -> List[str]:
     return out
 
 def details_block_from_lines(lines: List[str]) -> str:
-    """В HTML-цитату (<blockquote>) с переносами \\n (без <br>)."""
     clean = condense_detail_lines(lines)
     if not clean:
         return "<blockquote>No details</blockquote>"
-
     acc = ""
     for ln in clean:
         piece = html.escape(ln)
@@ -317,7 +314,6 @@ def details_block_from_lines(lines: List[str]) -> str:
 
 def fetch_details_by_postback(session: requests.Session, action_url: str, base_payload: Dict[str, str],
                               target: str, argument: str) -> Tuple[Optional[Tuple[float, float]], Optional[str], Optional[List[str]]]:
-    """Жмём 'Details' и возвращаем (coords, details_block_html, detail_lines_raw)."""
     payload = base_payload.copy()
     payload["__EVENTTARGET"] = target
     payload["__EVENTARGUMENT"] = argument
@@ -330,37 +326,116 @@ def fetch_details_by_postback(session: requests.Session, action_url: str, base_p
     details_block_html = details_block_from_lines(lines) if lines else None
     return coords, details_block_html, lines
 
-# ---------- ВЫЧИСЛЕНИЕ: расположение + число машин ----------
+# ---------- Расширенный парсер фактов ----------
 BARRIER_WORDS = {"BARRIER", "GUARDRAIL", "FENCE", "DEBRIS", "ANIMAL", "DEER", "TREE", "POLE", "SIGN"}
 
-def parse_location_and_count(detail_lines: Optional[List[str]]) -> Tuple[Optional[str], Optional[int]]:
+def parse_rich_facts(detail_lines: Optional[List[str]]) -> dict:
+    """
+    Возвращает словарь фактов, вычитанных из Detail Information.
+    Ключи:
+      vehicles (int|None)         — оценка числа ТС
+      vehicle_tags (set[str])     — {'MC','SEMI','TRK','PK'}
+      loc_label (str|None)        — 'правая обочина' | 'левая обочина' | 'CD'
+      lane_nums (set[str])        — {'1','2','3'} если упоминаются #1/#2/#3
+      hov (bool)                  — HOV упомянут
+      blocked (bool)              — BLKG/BLOCKING/ALL LNS STOPPED/1125 IN #
+      ramp (str|None)             — 'on-ramp' | 'off-ramp' | 'exit'
+      driveable (True|False|None) — машины на ходу?
+      chp_on (bool)               — CHP на месте (97)
+      chp_enrt (bool)             — CHP в пути (ENRT)
+      fire_on (bool)              — FIRE/1141
+      tow (str|None)              — 'requested' | 'enroute' | 'on_scene'
+    """
+    facts = {
+        "vehicles": None,
+        "vehicle_tags": set(),
+        "loc_label": None,
+        "lane_nums": set(),
+        "hov": False,
+        "blocked": False,
+        "ramp": None,
+        "driveable": None,
+        "chp_on": False,
+        "chp_enrt": False,
+        "fire_on": False,
+        "tow": None,
+    }
     if not detail_lines:
-        return None, None
-    text_up = " ".join(detail_lines).upper()
+        return facts
 
-    loc = None
-    if re.search(r"\bRS\b|\bRIGHT SHOULDER\b", text_up):
-        loc = "правая обочина"
-    if re.search(r"\bCD\b|\bCENTER DIVIDER\b", text_up):
-        loc = "CD"
-    if re.search(r"\bON[- ]?RAMP\b|\bOFF[- ]?RAMP\b|\bEXIT\b", text_up):
-        loc = "съезд"
+    text = " ".join(detail_lines).upper()
 
-    nums = [int(n) for n in re.findall(r"\b(\d{1,2})\s*VEH\b", text_up)]
-    veh_count = max(nums) if nums else None
-    if veh_count is None and "SOLO VEH" in text_up:
-        veh_count = 1
+    # --- место / полосы / hov / блокировки
+    if re.search(r"\bRS\b|\bRIGHT SHOULDER\b", text):
+        facts["loc_label"] = "правая обочина"
+    if re.search(r"\bLS\b|\bLEFT SHOULDER\b", text):
+        facts["loc_label"] = "левая обочина"
+    if re.search(r"\bCD\b|\bCENTER DIVIDER\b", text):
+        facts["loc_label"] = "CD"
+    if re.search(r"\bON[- ]?RAMP\b", text):
+        facts["ramp"] = "on-ramp"
+    if re.search(r"\bOFF[- ]?RAMP\b", text):
+        facts["ramp"] = "off-ramp"
+    if re.search(r"\bEXIT\b", text):
+        facts["ramp"] = "exit"
+    if re.search(r"\bHOV\b", text):
+        facts["hov"] = True
 
-    if veh_count is None and re.search(r"\bVS\b", text_up):
-        m = re.search(r"\b([A-Z0-9/&\- ]{2,30}?)\s+VS\s+([A-Z0-9/&\- ]{2,30}?)\b", text_up)
-        if m:
-            left = m.group(1).strip().split()[0]
-            right = m.group(2).strip().split()[0]
-            if left not in BARRIER_WORDS and right not in BARRIER_WORDS:
-                veh_count = 2
-    return loc, veh_count
+    for m in re.finditer(r"#\s*(\d+)", text):
+        facts["lane_nums"].add(m.group(1))
+    if re.search(r"\bBLKG?\b|\bBLOCK(ED|ING)\b|\bALL LNS STOPPED\b", text):
+        facts["blocked"] = True
+    if re.search(r"\b1125\b\s+(IN|#)", text):
+        facts["blocked"] = True
 
-# ---------- фильтры/формат ----------
+    # --- виды ТС
+    if re.search(r"\bMC\b|\bMOTORCYCLE\b", text): facts["vehicle_tags"].add("MC")
+    if re.search(r"\bSEMI\b|\bBIG\s*RIG\b|\bTRACTOR TRAILER\b", text): facts["vehicle_tags"].add("SEMI")
+    if re.search(r"\bTRK\b|\bTRUCK\b", text): facts["vehicle_tags"].add("TRK")
+    if re.search(r"\bPK\b|\bPICK ?UP\b", text): facts["vehicle_tags"].add("PK")
+
+    # --- число ТС
+    nums = [int(n) for n in re.findall(r"\b(\d{1,2})\s*VEHS?\b", text)]
+    if nums:
+        facts["vehicles"] = max(nums)
+    elif "SOLO VEH" in text:
+        facts["vehicles"] = 1
+    else:
+        vs_line = None
+        for ln in detail_lines:
+            if re.search(r"\bVS\b", ln.upper()):
+                vs_line = ln.upper(); break
+        if vs_line:
+            parts = [p for p in re.split(r"\bVS\b", vs_line) if p.strip()]
+            if len(parts) >= 2:
+                facts["vehicles"] = max(facts["vehicles"] or 0, len(parts))
+
+    # --- driveable
+    if re.search(r"\bNOT\s*DRIV(?:E|)ABLE\b|\bUNABLE TO MOVE VEH", text):
+        facts["driveable"] = False
+    elif re.search(r"\bVEH\s+IS\s+DRIVABLE\b|\bDRIVABLE\b", text):
+        facts["driveable"] = True
+
+    # --- CHP/FIRE/ENRT
+    if re.search(r"\b97\b", text):
+        facts["chp_on"] = True
+    if re.search(r"\bENRT\b", text):
+        facts["chp_enrt"] = True
+    if re.search(r"\bFIRE\b|\b1141\b", text):
+        # если 97 где-то в строках FIRE, считаем на месте
+        facts["fire_on"] = True if re.search(r"\bFIRE.*97\b|\b1141.*97\b", text) else facts["fire_on"]
+
+    # --- 1185 tow
+    if re.search(r"\bREQ\s+1185\b|\bSTART\s+1185\b", text):
+        facts["tow"] = "requested"
+    if re.search(r"\b1185\b.*\bENRT\b", text):
+        facts["tow"] = "enroute"
+    if re.search(r"\b1185\s+97\b|\bTOW\b.*\b97\b", text):
+        facts["tow"] = "on_scene"
+
+    return facts
+
+# ---------- формат/фильтры ----------
 def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
     type_re = re.compile(TYPE_REGEX, re.IGNORECASE) if TYPE_REGEX else None
     area_re = re.compile(AREA_REGEX, re.IGNORECASE) if AREA_REGEX else None
@@ -377,31 +452,62 @@ def filter_collisions(incidents: List[Dict[str, str]]) -> List[Dict[str, str]]:
 def make_text(inc: Dict[str, str],
               latlon: Optional[Tuple[float, float]],
               details_block: Optional[str],
-              loc_label: Optional[str],
-              veh_count: Optional[int],
+              facts: dict,
               closed: bool = False) -> str:
-    # выбрать эмодзи по типу
+    # эмодзи по типу – во второй строке
     icon = ""
     if "Collision" in inc['type']:
         icon = "🚨"
     elif "Hit" in inc['type'] and "Run" in inc['type']:
         icon = "🚗"
 
-    # первая строка — время и area
+    # первая строка — время и area (другие эмодзи для времени/ареа)
     title = (
         f"⏱ {html.escape(inc['time'])} | 🏙 {html.escape(inc['area'])}\n"
         f"{icon} {html.escape(inc['type'])}\n\n"
         f"📍 {html.escape(inc['location'])} — {html.escape(inc['locdesc'])}"
     )
 
-    # расположение / машины
-    bits = []
-    if loc_label:
-        bits.append(loc_label)
-    if veh_count is not None:
-        bits.append(f"{veh_count} ТС")
-    if bits:
-        title += "\n\n<b>📌 Расположение / Машины:</b>\n" + ", ".join(bits)
+    # --- компактный блок фактов ---
+    lines = []
+
+    # 1) Расположение/полосы/блокировки
+    loc_bits = []
+    if facts.get("loc_label"): loc_bits.append(facts["loc_label"])
+    if facts.get("ramp"): loc_bits.append(facts["ramp"])
+    if facts.get("lane_nums"):
+        loc_bits.append("#" + ",".join(sorted(facts["lane_nums"])))
+    if facts.get("hov"): loc_bits.append("HOV")
+    if facts.get("blocked"): loc_bits.append("блокировки")
+    if loc_bits:
+        lines.append(" · ".join(loc_bits))
+
+    # 2) Машины: число + типы
+    veh_bits = []
+    v = facts.get("vehicles")
+    if v is not None: veh_bits.append(f"{v} ТС")
+    tags = facts.get("vehicle_tags") or set()
+    if tags:
+        veh_bits.append(", ".join(sorted(tags)))
+    if veh_bits:
+        lines.append(" / ".join(veh_bits))
+
+    # 3) Службы и driveable
+    st_bits = []
+    if facts.get("chp_on"): st_bits.append("CHP 97")
+    elif facts.get("chp_enrt"): st_bits.append("CHP enrt")
+    if facts.get("fire_on"): st_bits.append("FIRE/1141")
+    tow = facts.get("tow")
+    if tow == "requested": st_bits.append("tow req")
+    elif tow == "enroute": st_bits.append("tow enrt")
+    elif tow == "on_scene": st_bits.append("tow 97")
+    if facts.get("driveable") is True: st_bits.append("driveable")
+    elif facts.get("driveable") is False: st_bits.append("NOT driveable")
+    if st_bits:
+        lines.append(", ".join(st_bits))
+
+    if lines:
+        title += "\n\n<b>📌 Расположение / Машины:</b>\n" + " | ".join(lines)
 
     # маршрут
     if latlon:
@@ -411,24 +517,37 @@ def make_text(inc: Dict[str, str],
     else:
         title += "\n\n<b>🗺️ Маршрут:</b>\nКоординаты недоступны"
 
-    # детали
+    # детали — сжатый blockquote
     if details_block:
         title += f"\n\n<b>📝 Detail Information:</b>\n{details_block}"
 
-    # закрыто
     if closed:
         title += "\n\n<b>❗️ Инцидент закрыт CHP</b>"
 
     return title
 
-def signature_for_update(inc: Dict[str, str], details_block: Optional[str]) -> str:
-    """Подпись содержимого, чтобы понять, изменилось ли что-то (тип/детали)."""
-    base = (inc.get("type","") + "||" + (details_block or "")).encode("utf-8", "ignore")
+def signature_for_update(inc: Dict[str, str], details_block: Optional[str], facts: dict) -> str:
+    # нормализуем детали и факты, чтобы редактировать только при реальных изменениях
+    norm_details = (details_block or "").replace("\u200b", "").strip()
+    fact_key = "|".join([
+        str(facts.get("vehicles")),
+        ",".join(sorted((facts.get("vehicle_tags") or set()))),
+        facts.get("loc_label") or "",
+        ",".join(sorted((facts.get("lane_nums") or set()))),
+        "HOV" if facts.get("hov") else "",
+        "BLK" if facts.get("blocked") else "",
+        facts.get("ramp") or "",
+        "DRV1" if facts.get("driveable") is True else ("DRV0" if facts.get("driveable") is False else ""),
+        "C97" if facts.get("chp_on") else ("CENRT" if facts.get("chp_enrt") else ""),
+        "FIRE" if facts.get("fire_on") else "",
+        {"requested":"TREQ","enroute":"TENRT","on_scene":"T97"}.get(facts.get("tow") or "", "")
+    ])
+    base = (inc.get("type","").strip() + "||" + norm_details + "||" + fact_key).encode("utf-8","ignore")
     return hashlib.sha1(base).hexdigest()
 
 # ---------- главный цикл ----------
 def main() -> None:
-    print(f"[INFO] CHP notifier v6.0 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
+    print(f"[INFO] CHP notifier v6.2 started. Center: {COMM_CENTER} | Interval: {POLL_INTERVAL}s")
     state = load_state()
     session = requests.Session()
 
@@ -441,7 +560,7 @@ def main() -> None:
             filtered = filter_collisions(incidents)
 
             for inc in filtered:
-                inc_id = inc["no"]  # уникальный ID строки на сегодня
+                inc_id = inc["no"]  # уникальный ID на текущие сутки
                 cycle_seen_ids.add(inc_id)
 
                 # тянем детали
@@ -454,9 +573,12 @@ def main() -> None:
                         inc["postback"]["target"], inc["postback"]["argument"]
                     )
 
-                loc_label, veh_count = parse_location_and_count(detail_lines)
-                text = make_text(inc, latlon, details_block, loc_label, veh_count, closed=False)
-                sig = signature_for_update(inc, details_block)
+                # извлекаем расширенные факты
+                facts = parse_rich_facts(detail_lines)
+
+                # формируем текст и подпись
+                text = make_text(inc, latlon, details_block, facts, closed=False)
+                sig = signature_for_update(inc, details_block, facts)
 
                 st = state.get(inc_id)
                 if st and st.get("message_id"):
@@ -470,7 +592,7 @@ def main() -> None:
                     st["misses"] = 0
                     st["last_seen"] = dt.datetime.utcnow().isoformat()
                 else:
-                    # отправляем новое
+                    # новое событие
                     mid = tg_send(text, chat_id=TELEGRAM_CHAT_ID)
                     state[inc_id] = {
                         "message_id": mid,
@@ -483,23 +605,20 @@ def main() -> None:
                         "last_seen": dt.datetime.utcnow().isoformat(),
                     }
 
-            # обработка "исчезнувших" инцидентов — возможно закрыты
+            # обработка потенциально закрытых
             for inc_id, st in list(state.items()):
-                # учитываем только наши сегодняшние инциденты (формат ID у CHP обнуляется каждый день)
                 if inc_id not in cycle_seen_ids and isinstance(st, dict):
                     st["misses"] = st.get("misses", 0) + 1
-                    # если уже закрыт — игнорим
                     if st.get("closed"):
                         continue
                     if st["misses"] >= MISSES_TO_CLOSE and st.get("message_id"):
-                        new_text = (st.get("last_text") or "") + "\n\n<b>❗️ Закрыто CHP</b>"
+                        new_text = (st.get("last_text") or "") + "\n\n<b>❗️ Инцидент закрыт CHP</b>"
                         ok = tg_edit(st["message_id"], new_text, chat_id=st.get("chat_id") or TELEGRAM_CHAT_ID)
                         if ok:
                             st["last_text"] = new_text
                             st["closed"] = True
 
             save_state(state)
-
             print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {COMM_CENTER}: rows={len(incidents)}, matched={len(filtered)}, tracked={len(state)}")
 
         except KeyboardInterrupt:
