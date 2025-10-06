@@ -646,7 +646,6 @@ def _unique_join(parts: list, sep: str = ", ") -> str:
         seen.add(p); out.append(p)
     return sep.join(out)
 
-# ---------- revamped make_text: summary first, markers dedup ----------
 def make_text(inc: Dict[str, str],
               latlon: Optional[Tuple[float, float]],
               details_lines_clean: List[str],
@@ -667,13 +666,13 @@ def make_text(inc: Dict[str, str],
         f"📍 {html.escape(inc['location'])} — {html.escape(inc['locdesc'])}"
     )
 
-    # 1) человеческое резюме + set полей, которые уже сказаны
+    # 1) человеческое резюме + какие поля уже употребили
     summary_line, consumed = human_summary_from_facts(facts)
 
-    # 2) компактные маркеры без повторов и БЕЗ «блокировок»/кодов
+    # 2) компактные маркеры (без повторов и БЕЗ «блокировок»/кодов)
     markers = []
 
-    # — Место (если не использовано в резюме)
+    # — Место
     loc_bits = []
     if "loc_label" not in consumed and facts.get("loc_label"):
         loc_bits.append(facts["loc_label"])
@@ -688,7 +687,7 @@ def make_text(inc: Dict[str, str],
     if loc_bits:
         markers.append(_unique_join(loc_bits, " · "))
 
-    # — Машины (если не использовано в резюме)
+    # — Машины
     veh_bits = []
     if "vehicles" not in consumed and facts.get("vehicles") is not None:
         veh_bits.append(f"{facts['vehicles']} ТС")
@@ -706,16 +705,21 @@ def make_text(inc: Dict[str, str],
     if "fire_on" not in consumed and facts.get("fire_on"):
         st_bits.append("медики/пожарные")
     if "tow" not in consumed and facts.get("tow"):
-        if facts["tow"] == "requested": st_bits.append("эвакуатор вызван")
-        elif facts["tow"] == "enroute": st_bits.append("эвакуатор в пути")
-        elif facts["tow"] == "on_scene": st_bits.append("эвакуатор на месте")
+        if facts["tow"] == "requested":
+            st_bits.append("эвакуатор вызван")
+        elif facts["tow"] == "enroute":
+            st_bits.append("эвакуатор в пути")
+        elif facts["tow"] == "on_scene":
+            st_bits.append("эвакуатор на месте")
     if "driveable" not in consumed:
-        if facts.get("driveable") is True:  st_bits.append("на ходу")
-        elif facts.get("driveable") is False: st_bits.append("не на ходу")
+        if facts.get("driveable") is True:
+            st_bits.append("на ходу")
+        elif facts.get("driveable") is False:
+            st_bits.append("не на ходу")
     if st_bits:
         markers.append(_unique_join(st_bits, ", "))
 
-    # Сборка фактового блока
+    # Фактовый блок
     facts_block_lines = []
     if summary_line:
         facts_block_lines.append(summary_line)
@@ -723,15 +727,15 @@ def make_text(inc: Dict[str, str],
         facts_block_lines.append(" | ".join(markers))
     facts_block = "\n\n<b>📌 Расположение / Машины:</b>\n" + "\n".join(facts_block_lines) if facts_block_lines else ""
 
-# карта (метка по координатам)
-if latlon:
-    lat, lon = latlon
-    map_url = f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
-    route_block = f"\n\n<b>🗺️ Карта:</b>\n{map_url}"
-else:
-    route_block = "\n\n<b>🗺️ Карта:</b>\nКоординаты недоступны"
+    # КАРТА: всегда метка по координатам (а не маршрут)
+    if latlon:
+        lat, lon = latlon
+        map_url = f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
+        route_block = f"\n\n<b>🗺️ Карта:</b>\n{map_url}"
+    else:
+        route_block = "\n\n<b>🗺️ Карта:</b>\nКоординаты недоступны"
 
-    # детали: динамично обрезаем чтобы <= 4096
+    # детали (с динамическим ограничением до 4096)
     skeleton = head + facts_block + route_block
     leftover = TG_HARD_LIMIT - len(skeleton) - len("\n\n<b>📝 Detail Information:</b>\n") - (len("\n\n<b>❗️ Инцидент закрыт CHP</b>") if closed else 0)
     cap = max(0, min(MAX_DETAIL_CHARS_BASE, leftover))
