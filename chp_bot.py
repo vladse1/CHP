@@ -723,13 +723,13 @@ def make_text(inc: Dict[str, str],
         facts_block_lines.append(" | ".join(markers))
     facts_block = "\n\n<b>📌 Расположение / Машины:</b>\n" + "\n".join(facts_block_lines) if facts_block_lines else ""
 
-    # маршрут
-    if latlon:
-        lat, lon = latlon
-        map_url = f"https://www.google.com/maps/dir/?api=1&destination={lat:.6f},{lon:.6f}&travelmode=driving"
-        route_block = f"\n\n<b>🗺️ Маршрут:</b>\n{map_url}"
-    else:
-        route_block = "\n\n<b>🗺️ Маршрут:</b>\nКоординаты недоступны"
+# карта (метка по координатам)
+if latlon:
+    lat, lon = latlon
+    map_url = f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
+    route_block = f"\n\n<b>🗺️ Карта:</b>\n{map_url}"
+else:
+    route_block = "\n\n<b>🗺️ Карта:</b>\nКоординаты недоступны"
 
     # детали: динамично обрезаем чтобы <= 4096
     skeleton = head + facts_block + route_block
