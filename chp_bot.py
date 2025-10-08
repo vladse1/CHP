@@ -4,15 +4,31 @@
 """
 CHP CAD → Telegram бот (инциденты ДТП)
 
+Зависимости (requirements.txt):
+  requests
+  beautifulsoup4
+  python-dotenv
+
+.env (пример):
+  TELEGRAM_TOKEN=123456:ABC...your-bot-token
+  TELEGRAM_CHAT_ID=-1001234567890
+  COMM_CENTER=Inland
+  TYPE_REGEX=(Collision|Hit\s*(?:&|and)\s*Run)
+  POLL_INTERVAL=30
+  MISSES_TO_CLOSE=2
+  MAX_DETAIL_CHARS=2500
+  TZ=America/Los_Angeles
+  LOG_LEVEL=INFO
+
 Особенности:
-- Выбор Communications Center (устойчиво к вариантам ASP.NET кнопки OK)
+- Устойчивый выбор Communications Center: кнопка OK → __EVENTTARGET → AJAX (ScriptManager + __ASYNCPOST)
 - Ключ инцидента: CENTER:YYYYMMDD:NNNN (нет конфликтов номеров между днями/центрами)
 - Очистка «вчерашних» записей из seen.json
 - Парсинг таблицы по заголовкам (не привязан к фиксированным индексам)
 - Постбэк Details → извлекаем координаты и строки "Detail Information"
 - Нормализация details в факты (обочины/полосы/HOV/съезды, driveable, CHP/FIRE, 1185, типы ТС)
 - Человеческое резюме без повторов/кодов/«блокировок»
-- Карта: всегда ссылка-метка (search?query=lat,lon)
+- Карта: всегда ссылка-метка (search?query=lat,lon) — универсально
 - Телеграм: send/edit + фоллбэк (если редактировать нельзя → отправить новое)
 - Retry с экспоненциальным backoff, джиттер в запросах и основном цикле
 - Динамическая подрезка деталей до 4096 символов
@@ -219,46 +235,121 @@ def _collect_form_fields(soup: BS) -> dict:
             data.setdefault(name, "")
     return data
 
-def post_select_center(session: requests.Session, soup: BS, center: str) -> BS:
-    # ищем нужный option
+def _find_control_names(soup: BS) -> dict:
+    """
+    Находим имена ключевых контролов:
+    - dropdown центра (ddlCommCenters)
+    - ScriptManager (для AJAX)
+    - UpdatePanel (контейнер с сеткой)
+    - submit-кнопки с надписью OK/Apply/Go/View/Load
+    """
+    names = {}
+
     sel = soup.find("select", {"name": re.compile(r"ddlCommCenters", re.I)})
-    selected_val = None
     if sel:
-        for opt in sel.find_all("option"):
+        names["ddl_name"] = sel.get("name")
+        names["ddl_id"] = sel.get("id")
+        names["ddl_elem"] = sel
+
+    sm = soup.find("input", {"name": re.compile(r"ScriptManager", re.I)})
+    if sm:
+        names["sm_name"] = sm.get("name")
+        names["sm_id"] = sm.get("id")
+
+    up = soup.find(attrs={"id": re.compile(r"UpdatePanel", re.I)}) or soup.find("div", {"id": re.compile(r"MainContent", re.I)})
+    if up:
+        names["up_id"] = up.get("id")
+
+    btns = []
+    for inp in soup.find_all(["input", "button"]):
+        if inp.name == "input" and inp.get("type", "").lower() not in ("submit", "button"):
+            continue
+        label = (inp.get("value") or inp.get_text() or "").strip()
+        if re.search(r"\b(OK|Apply|Go|View|Load)\b", label, re.I):
+            nm = inp.get("name")
+            if nm:
+                btns.append(nm)
+    names["ok_buttons"] = btns
+
+    return names
+
+def post_select_center(session: requests.Session, soup: BS, center: str) -> BS:
+    """
+    Пытаемся выбрать Communications Center:
+      План A: обычный submit с dropdown + любой 'OK/Apply/Go/View/Load' кнопкой.
+      План B: обычный postback с __EVENTTARGET = ddlCommCenters (non-AJAX).
+      План C: AJAX postback (ScriptManager + __ASYNCPOST=true) + добивающий GET.
+    """
+    names = _find_control_names(soup)
+    ddl = names.get("ddl_elem")
+    ddl_name = names.get("ddl_name")
+    selected_val = None
+
+    # найдём value нужного option
+    if ddl:
+        for opt in ddl.find_all("option"):
             if opt.text.strip().lower() == center.strip().lower():
                 selected_val = opt.get("value", opt.text.strip())
                 break
     if not selected_val:
         selected_val = center
 
-    # пробуем через разные кнопки OK
-    candidates = [
-        "ctl00$MainContent$btnSelCommCenter",
-        "ctl00$MainContent$btnCommCenters",
-        "ctl00$MainContent$btnOK",
-    ]
-    for btn in candidates:
+    # План A: submit с кнопкой
+    if names.get("ok_buttons") and ddl_name:
+        for btn_name in names["ok_buttons"]:
+            data = _collect_form_fields(soup)
+            data.update({
+                ddl_name: selected_val,
+                btn_name: "OK",
+            })
+            r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
+            _dump("page_after_center_btn.html", r.text)
+            s2 = BS(r.text, "html.parser")
+            if s2.find("table", {"id": re.compile(r"gvIncidents", re.I)}):
+                return s2
+
+    # План B: __EVENTTARGET на dropdown
+    if ddl_name:
         data = _collect_form_fields(soup)
         data.update({
-            "ctl00$MainContent$ddlCommCenters": selected_val,
-            btn: "OK",
+            ddl_name: selected_val,
+            "__EVENTTARGET": ddl_name,
+            "__EVENTARGUMENT": "",
         })
         r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
-        _dump("page_after_center_btn.html", r.text)
+        _dump("page_after_center_evt.html", r.text)
         s2 = BS(r.text, "html.parser")
         if s2.find("table", {"id": re.compile(r"gvIncidents", re.I)}):
             return s2
 
-    # fallback — триггерим сам dropdown как __EVENTTARGET
-    data = _collect_form_fields(soup)
-    data.update({
-        "ctl00$MainContent$ddlCommCenters": selected_val,
-        "__EVENTTARGET": "ctl00$MainContent$ddlCommCenters",
-        "__EVENTARGUMENT": "",
-    })
-    r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
-    _dump("page_after_center_evt.html", r.text)
-    return BS(r.text, "html.parser")
+    # План C: AJAX (ScriptManager + __ASYNCPOST)
+    sm_name = names.get("sm_name")
+    up_id = names.get("up_id")
+    ddl_id = names.get("ddl_id")
+    if sm_name and ddl_name and (up_id or ddl_id):
+        data = _collect_form_fields(soup)
+        data.update({
+            ddl_name: selected_val,
+            "__EVENTTARGET": ddl_name,
+            "__EVENTARGUMENT": "",
+            "__ASYNCPOST": "true",
+            sm_name: f"{up_id or ''}|{ddl_id or ddl_name}",
+        })
+        headers = {
+            "User-Agent": random.choice(UA_POOL),
+            "X-MicrosoftAjax": "Delta=true"
+        }
+        r = http_post(session, BASE_URL, data=data, headers=headers)
+        _dump("page_after_center_ajax.html", r.text)
+        # добивающий GET — сервер уже применил выбранный центр
+        r2 = http_get(session, BASE_URL, headers={"User-Agent": random.choice(UA_POOL)})
+        _dump("page_after_center_get.html", r2.text)
+        s3 = BS(r2.text, "html.parser")
+        if s3.find("table", {"id": re.compile(r"gvIncidents", re.I)}):
+            return s3
+
+    # если ничего не сработало — вернём исходный soup (парсер увидит warning)
+    return soup
 
 def do_postback(session: requests.Session, soup: BS, target: str) -> BS:
     data = _collect_form_fields(soup)
@@ -278,7 +369,6 @@ def parse_table_rows(soup: BS) -> List[dict]:
         log.warning("incidents grid not found after center select")
         return out
 
-    # карта индексов по заголовкам
     header = grid.find("tr")
     ths = [th.get_text(" ", strip=True) for th in (header.find_all("th") if header else [])]
     cols = {name.lower(): idx for idx, name in enumerate(ths)}
@@ -358,7 +448,6 @@ def parse_details_panel(soup: BS) -> tuple[Optional[Tuple[float,float]], List[st
                     break
                 if tx:
                     text_region.append(tx)
-        # разрезаем на строки и чистим хвосты
         joined = "\n".join(text_region)
         for ln in joined.splitlines():
             s = ln.strip()
@@ -535,6 +624,7 @@ def _unique_join(parts: list, sep: str = ", ") -> str:
         if not p or p in seen:
             continue
         seen.add(p); out.append(p)
+        # dedup
     return sep.join(out)
 
 def human_summary_from_facts(facts: dict) -> tuple[str, set]:
@@ -802,7 +892,6 @@ def main():
                     if inc_id not in seen_ids and not st.get("closed"):
                         st["misses"] = st.get("misses", 0) + 1
                         if st["misses"] >= MISSES_TO_CLOSE:
-                            # финальное редактирование с плашкой
                             try:
                                 final = st.get("last_text", "")
                                 if final:
