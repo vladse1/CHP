@@ -3,12 +3,19 @@
 
 """
 CHP CAD → Telegram бот (инциденты ДТП)
-- Ключ инцидента: CENTER:YYYYMMDD:NNNN (без конфликтов между днями/центрами)
-- Умный разбор Details → факты (обочины/полосы/HOV/съезды, driveable, CHP/FIRE, 1185 ...).
-- Человеческое резюме без повторов и без кодов/«блокировок».
-- Карта: всегда метка по координатам (универсальная ссылка).
-- Телеграм: send/edit + фоллбэк (если редактировать нельзя → отправляем новое).
-- Джиттер и backoff для запросов. Динамическая подрезка текста до 4096.
+
+Особенности:
+- Выбор Communications Center (устойчиво к вариантам ASP.NET кнопки OK)
+- Ключ инцидента: CENTER:YYYYMMDD:NNNN (нет конфликтов номеров между днями/центрами)
+- Очистка «вчерашних» записей из seen.json
+- Парсинг таблицы по заголовкам (не привязан к фиксированным индексам)
+- Постбэк Details → извлекаем координаты и строки "Detail Information"
+- Нормализация details в факты (обочины/полосы/HOV/съезды, driveable, CHP/FIRE, 1185, типы ТС)
+- Человеческое резюме без повторов/кодов/«блокировок»
+- Карта: всегда ссылка-метка (search?query=lat,lon)
+- Телеграм: send/edit + фоллбэк (если редактировать нельзя → отправить новое)
+- Retry с экспоненциальным backoff, джиттер в запросах и основном цикле
+- Динамическая подрезка деталей до 4096 символов
 """
 
 import os
@@ -56,6 +63,7 @@ UA_POOL = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
 ]
 
+
 # ===== utilities: state =====
 
 def today_str() -> str:
@@ -93,11 +101,12 @@ def purge_old_state(state: dict) -> None:
         if not isinstance(v, dict) or not v.get("message_id"):
             state.pop(k, None)
 
+
 # ===== HTTP with backoff =====
 
 def backoff_sleep(attempt: int, base: float = 0.5, cap: float = 10.0):
     delay = min(cap, base * (2 ** (attempt - 1)))
-    delay += random.uniform(0.0, 0.5)  # небольшой джиттер
+    delay += random.uniform(0.0, 0.5)  # лёгкий джиттер
     time.sleep(delay)
 
 def http_get(session: requests.Session, url: str, **kw) -> requests.Response:
@@ -129,6 +138,7 @@ def http_post(session: requests.Session, url: str, data: dict, **kw) -> requests
             log.debug("POST error %s (try %d)", e, i)
             backoff_sleep(i)
     raise RuntimeError(f"POST failed after retries: {url}")
+
 
 # ===== Telegram =====
 
@@ -179,7 +189,191 @@ def tg_edit(message_id: int, text: str, chat_id: Optional[str] = None) -> tuple[
     except Exception as e:
         return (False, str(e))
 
-# ===== Parsing helpers (facts) =====
+
+# ===== debug dump (опционально) =====
+
+def _dump(name: str, html_text: str):
+    try:
+        with open(name, "w", encoding="utf-8") as f:
+            f.write(html_text)
+        log.debug("dumped %s (%d bytes)", name, len(html_text))
+    except Exception:
+        pass
+
+
+# ===== CHP page scraping =====
+
+def get_soup(session: requests.Session) -> BS:
+    r = http_get(session, BASE_URL, headers={"User-Agent": random.choice(UA_POOL)})
+    _dump("page_before.html", r.text)
+    return BS(r.text, "html.parser")
+
+def _collect_form_fields(soup: BS) -> dict:
+    data = {}
+    for name in ["__EVENTTARGET", "__EVENTARGUMENT", "__LASTFOCUS",
+                 "__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
+        tag = soup.find("input", {"name": name})
+        if tag and tag.has_attr("value"):
+            data[name] = tag["value"]
+        else:
+            data.setdefault(name, "")
+    return data
+
+def post_select_center(session: requests.Session, soup: BS, center: str) -> BS:
+    # ищем нужный option
+    sel = soup.find("select", {"name": re.compile(r"ddlCommCenters", re.I)})
+    selected_val = None
+    if sel:
+        for opt in sel.find_all("option"):
+            if opt.text.strip().lower() == center.strip().lower():
+                selected_val = opt.get("value", opt.text.strip())
+                break
+    if not selected_val:
+        selected_val = center
+
+    # пробуем через разные кнопки OK
+    candidates = [
+        "ctl00$MainContent$btnSelCommCenter",
+        "ctl00$MainContent$btnCommCenters",
+        "ctl00$MainContent$btnOK",
+    ]
+    for btn in candidates:
+        data = _collect_form_fields(soup)
+        data.update({
+            "ctl00$MainContent$ddlCommCenters": selected_val,
+            btn: "OK",
+        })
+        r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
+        _dump("page_after_center_btn.html", r.text)
+        s2 = BS(r.text, "html.parser")
+        if s2.find("table", {"id": re.compile(r"gvIncidents", re.I)}):
+            return s2
+
+    # fallback — триггерим сам dropdown как __EVENTTARGET
+    data = _collect_form_fields(soup)
+    data.update({
+        "ctl00$MainContent$ddlCommCenters": selected_val,
+        "__EVENTTARGET": "ctl00$MainContent$ddlCommCenters",
+        "__EVENTARGUMENT": "",
+    })
+    r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
+    _dump("page_after_center_evt.html", r.text)
+    return BS(r.text, "html.parser")
+
+def do_postback(session: requests.Session, soup: BS, target: str) -> BS:
+    data = _collect_form_fields(soup)
+    data.update({
+        "__EVENTTARGET": target,
+        "__EVENTARGUMENT": "",
+    })
+    time.sleep(random.uniform(0.5, 1.5))  # маленький джиттер
+    r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
+    _dump("page_details.html", r.text)
+    return BS(r.text, "html.parser")
+
+def parse_table_rows(soup: BS) -> List[dict]:
+    out = []
+    grid = soup.find("table", {"id": re.compile(r"gvIncidents", re.I)})
+    if not grid:
+        log.warning("incidents grid not found after center select")
+        return out
+
+    # карта индексов по заголовкам
+    header = grid.find("tr")
+    ths = [th.get_text(" ", strip=True) for th in (header.find_all("th") if header else [])]
+    cols = {name.lower(): idx for idx, name in enumerate(ths)}
+
+    def idx(key: str, default: int) -> int:
+        for k in cols:
+            if key in k:
+                return cols[k]
+        return default
+
+    i_details = 0
+    i_no      = idx("no", 1)
+    i_time    = idx("time", 2)
+    i_type    = idx("type", 3)
+    i_loc     = idx("location", 4)
+    i_locd    = idx("loc", 5)   # Location Desc.
+    i_area    = idx("area", 6)
+
+    body = grid.find("tbody") or grid
+    for tr in body.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 6:
+            continue
+        a = tds[i_details].find("a")
+        if not a:
+            continue
+        href = a.get("href", "")
+        m = re.search(r"__doPostBack\('([^']+)'", href)
+        target = m.group(1) if m else None
+
+        def get(i):
+            return tds[i].get_text(" ", strip=True) if i < len(tds) else ""
+
+        out.append({
+            "no": get(i_no),
+            "time": get(i_time),
+            "type": get(i_type),
+            "location": get(i_loc),
+            "locdesc": get(i_locd),
+            "area": get(i_area),
+            "target": target
+        })
+    return out
+
+def parse_details_panel(soup: BS) -> tuple[Optional[Tuple[float,float]], List[str]]:
+    """Возвращает (latlon, detail_lines). detail_lines — уже очищенные строки Detail Information."""
+    # координаты из ссылки
+    latlon = None
+    coord_link = None
+    for a in soup.find_all("a"):
+        href = a.get("href", "")
+        if "google.com/maps/place" in href or "google.com/maps/search" in href:
+            coord_link = href
+            break
+    if coord_link:
+        mm = re.search(r"([-+]?\d+\.\d+)[ ,]+([-+]?\d+\.\d+)", coord_link)
+        if mm:
+            try:
+                latlon = (float(mm.group(1)), float(mm.group(2)))
+            except Exception:
+                latlon = None
+
+    # строки Detail Information
+    details_lines = []
+    marker = None
+    for b in soup.find_all(text=re.compile(r"Detail Information", re.I)):
+        marker = b.parent
+        break
+
+    if marker:
+        cur = marker.parent
+        text_region = []
+        for el in cur.next_siblings:
+            if getattr(el, "get_text", None):
+                tx = el.get_text("\n", strip=True)
+                if re.search(r"Unit Information", tx, re.I):
+                    break
+                if tx:
+                    text_region.append(tx)
+        # разрезаем на строки и чистим хвосты
+        joined = "\n".join(text_region)
+        for ln in joined.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if s.startswith("Click on Details"):
+                break
+            if s.startswith("| Contact Us") or s.endswith("CHP Mobile Traffic") or s.endswith("CHP Home Page"):
+                continue
+            details_lines.append(s)
+
+    return latlon, details_lines
+
+
+# ===== Details → facts =====
 
 VEHICLE_TAG_MAP = [
     (re.compile(r'\bMC\b|MOTORCYCLE', re.I), "мотоцикл"),
@@ -235,7 +429,7 @@ def parse_details_to_facts(detail_lines: List[str]) -> dict:
         "chp_enrt": False,
         "fire_on": False,
         "tow": None,
-        "blocked": False,
+        "blocked": False,          # в БД можно хранить, в тексте не показываем
         "last_time_hint": None,
     }
 
@@ -312,6 +506,7 @@ def parse_details_to_facts(detail_lines: List[str]) -> dict:
     facts["vehicles"] = veh_count or None
 
     return facts
+
 
 # ===== Formatting (summary + message) =====
 
@@ -407,6 +602,7 @@ def blockquote_from_lines(lines: List[str], limit_chars: int) -> str:
         s = ln.strip()
         if not s:
             continue
+        # "8:29 AM 2 [..]" -> "8:29 AM: .."
         s = re.sub(r'^\s*([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM))\s+\d+\s+', r'\1: ', s, flags=re.I)
         s = html.escape(s)
         chunk = f"› {s}\n"
@@ -477,7 +673,7 @@ def make_text(inc: Dict[str, str],
     if markers:      facts_block_lines.append(" | ".join(markers))
     facts_block = "\n\n<b>📌 Расположение / Машины:</b>\n" + "\n".join(facts_block_lines) if facts_block_lines else ""
 
-    # карта: всегда метка (универсально)
+    # карта: всегда ссылка-метка
     if latlon:
         lat, lon = latlon
         map_url = f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
@@ -498,6 +694,7 @@ def make_text(inc: Dict[str, str],
     if closed:
         text += "\n\n<b>❗️ Инцидент закрыт CHP</b>"
 
+    # страховка: если внезапно перебрали лимит
     if len(text) > TG_HARD_LIMIT and det_block:
         shrink = int(cap * 0.8)
         details_block = blockquote_from_lines(details_lines_clean, max(0, shrink))
@@ -508,132 +705,6 @@ def make_text(inc: Dict[str, str],
 
     return text
 
-# ===== CHP page scraping =====
-
-def get_soup(session: requests.Session) -> BS:
-    r = http_get(session, BASE_URL, headers={"User-Agent": random.choice(UA_POOL)})
-    return BS(r.text, "html.parser")
-
-def form_fields(soup: BS) -> dict:
-    data = {}
-    for name in ["__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR"]:
-        tag = soup.find("input", {"name": name})
-        if tag and tag.has_attr("value"):
-            data[name] = tag["value"]
-    return data
-
-def post_select_center(session: requests.Session, soup: BS, center: str) -> BS:
-    data = form_fields(soup)
-    # выбрать центр в дропдауне + нажать OK
-    sel = soup.find("select", {"name": "ctl00$MainContent$ddlCommCenters"})
-    found_val = None
-    if sel:
-        for opt in sel.find_all("option"):
-            if opt.text.strip().lower() == center.strip().lower():
-                found_val = opt.get("value", opt.text.strip())
-                break
-    if not found_val:
-        found_val = center
-    data.update({
-        "ctl00$MainContent$ddlCommCenters": found_val,
-        "ctl00$MainContent$btnSelCommCenter": "OK",
-        "__EVENTTARGET": "",
-        "__EVENTARGUMENT": "",
-    })
-    r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
-    return BS(r.text, "html.parser")
-
-def do_postback(session: requests.Session, soup: BS, target: str) -> BS:
-    data = form_fields(soup)
-    data.update({
-        "__EVENTTARGET": target,
-        "__EVENTARGUMENT": "",
-    })
-    # маленький джиттер меж постбэками
-    time.sleep(random.uniform(0.5, 1.5))
-    r = http_post(session, BASE_URL, data=data, headers={"User-Agent": random.choice(UA_POOL)})
-    return BS(r.text, "html.parser")
-
-def parse_table_rows(soup: BS) -> List[dict]:
-    """Возвращает список словарей по строкам таблицы."""
-    out = []
-    # ищем грид
-    grid = soup.find("table", {"id": "ctl00_MainContent_gvIncidents"})
-    if not grid:
-        return out
-    body = grid.find("tbody") or grid
-    for tr in body.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 6:
-            continue
-        # колонки (примерно): Details | No. | Time | Type | Location | LocDesc | Area
-        details_a = tds[0].find("a")
-        if not details_a:
-            continue
-        no = tds[1].get_text(strip=True)
-        tm = tds[2].get_text(strip=True)
-        typ = tds[3].get_text(" ", strip=True)
-        loc = tds[4].get_text(" ", strip=True)
-        locdesc = tds[5].get_text(" ", strip=True) if len(tds) > 5 else ""
-        area = tds[6].get_text(" ", strip=True) if len(tds) > 6 else ""
-        href = details_a.get("href", "")
-        m = re.search(r"__doPostBack\('([^']+)'", href)
-        target = m.group(1) if m else None
-        out.append({
-            "no": no, "time": tm, "type": typ, "location": loc, "locdesc": locdesc,
-            "area": area, "target": target
-        })
-    return out
-
-def parse_details_panel(soup: BS) -> tuple[Optional[Tuple[float,float]], List[str]]:
-    """Парсим всплывающую панель Details: lat/lon + список строк Detail Information."""
-    # координаты
-    latlon = None
-    coord_link = None
-    for a in soup.find_all("a"):
-        href = a.get("href", "")
-        if "google.com/maps/place" in href or "google.com/maps/search" in href:
-            coord_link = href
-            break
-    if coord_link:
-        mm = re.search(r"([-+]?\d+\.\d+)[ ,]+([-+]?\d+\.\d+)", coord_link)
-        if mm:
-            try:
-                latlon = (float(mm.group(1)), float(mm.group(2)))
-            except Exception:
-                latlon = None
-
-    # блок Detail Information: собираем строки
-    details_lines = []
-    panel = None
-    # ищем подпись "Detail Information"
-    for b in soup.find_all(text=re.compile(r"Detail Information", re.I)):
-        panel = b.parent
-        break
-    # fallback — иногда структура другая; просто найдём ближайший контейнер до "Unit Information"
-    if panel:
-        # собираем последующий текст до "Unit Information"
-        cur = panel.parent
-        text_region = []
-        stop = False
-        for el in cur.next_siblings:
-            if getattr(el, "get_text", None):
-                tx = el.get_text("\n", strip=True)
-                if re.search(r"Unit Information", tx, re.I):
-                    break
-                if tx:
-                    text_region.append(tx)
-        # разрезаем на строки
-        joined = "\n".join(text_region)
-        for ln in joined.splitlines():
-            s = ln.strip()
-            if not s:
-                continue
-            # отсекаем служебные хвосты типа "Click on Details ..."
-            if s.startswith("Click on Details"):
-                break
-            details_lines.append(s)
-    return latlon, details_lines
 
 # ===== Main loop =====
 
@@ -646,11 +717,10 @@ def main():
 
         while True:
             try:
-                soup = get_soup(s)
-                soup = post_select_center(s, soup, COMM_CENTER)
+                soup0 = get_soup(s)
+                soup = post_select_center(s, soup0, COMM_CENTER)
                 rows = parse_table_rows(soup)
 
-                # процессим строки
                 seen_ids = set()
                 for row in rows:
                     if not TYPE_RE.search(row["type"]):
@@ -660,30 +730,24 @@ def main():
                     inc_id = compose_incident_key(COMM_CENTER, row["no"])
                     seen_ids.add(inc_id)
 
-                    # получаем details (postback)
                     if not row.get("target"):
                         continue
                     soup_det = do_postback(s, soup, row["target"])
                     latlon, detail_lines = parse_details_panel(soup_det)
-
-                    # подготовим чистые строки details (из панели)
                     detail_lines_clean = detail_lines[:]
 
                     facts = parse_details_to_facts(detail_lines_clean)
                     text = make_text(row, latlon, detail_lines_clean, facts, closed=False)
-
-                    # подпись состояния для сравнения (чтобы лишний раз не редактировать)
                     sig = hash((text,))
 
                     st = state.get(inc_id)
 
-                    # если запись от другого чата — переотправим как новую
+                    # если чат сменился — форсим новое сообщение
                     if st and st.get("chat_id") and st["chat_id"] != TELEGRAM_CHAT_ID:
                         log.warning("Chat changed for %s: %s -> %s; resending",
                                     inc_id, st["chat_id"], TELEGRAM_CHAT_ID)
                         st = None
 
-                    # новое сообщение
                     if not st:
                         mid = tg_send(text, chat_id=TELEGRAM_CHAT_ID)
                         if mid:
@@ -702,10 +766,9 @@ def main():
                             log.error("send failed for %s", inc_id)
                         continue
 
-                    # уже есть — возможно редактирование
+                    # обновление
                     st["misses"] = 0
                     st["last_seen"] = dt.datetime.utcnow().isoformat()
-
                     if st.get("last_sig") != sig or st.get("closed"):
                         ok, reason = tg_edit(st["message_id"], text, chat_id=st.get("chat_id") or TELEGRAM_CHAT_ID)
                         if not ok:
@@ -733,14 +796,13 @@ def main():
 
                 # закрытие пропавших
                 for inc_id, st in list(state.items()):
-                    # только сегодняшние записи
                     parts = inc_id.split(":")
                     if len(parts) < 3 or parts[1] != today_str():
                         continue
                     if inc_id not in seen_ids and not st.get("closed"):
                         st["misses"] = st.get("misses", 0) + 1
                         if st["misses"] >= MISSES_TO_CLOSE:
-                            # отправим финальную плашку
+                            # финальное редактирование с плашкой
                             try:
                                 final = st.get("last_text", "")
                                 if final:
@@ -761,6 +823,7 @@ def main():
             except Exception as e:
                 log.exception("loop error: %s", e)
                 time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
