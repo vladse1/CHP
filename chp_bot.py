@@ -1088,16 +1088,19 @@ def main():
     state = load_state()
     session = requests.Session()
 
-   import certifi
-session.verify = certifi.where()  # используем актуальный корневой пакет
+    # --- SSL/сертификаты ---
+    # По умолчанию используем свежие корневые сертификаты из certifi.
+    # Если CHP_INSECURE_SSL=true, временно отключаем проверку (когда у CHP проблемы с cert).
+    import certifi
+    session.verify = certifi.where()  # используем актуальный корневой пакет
 
-if CHP_INSECURE_SSL:
-    session.verify = False
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    except Exception:
-        pass
+    if CHP_INSECURE_SSL:
+        session.verify = False
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
 
     while True:
         cycle_seen_ids = set()
@@ -1108,6 +1111,7 @@ if CHP_INSECURE_SSL:
             html_text = choose_communications_center(session, COMM_CENTER)
             soup, incidents = parse_incidents_with_postbacks(html_text)
             action_url, base_payload = extract_form_state(soup)
+            # ... остальной код цикла ...
 
             # применяем фильтры по типу/локации/ареа заранее
             type_re = re.compile(TYPE_REGEX, re.I) if TYPE_REGEX else None
