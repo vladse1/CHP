@@ -128,6 +128,9 @@ MAX_DETAIL_CHARS_BASE = int(os.getenv("MAX_DETAIL_CHARS", "2500"))
 # файл состояния (seen.json)
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 
+# SSL fallback (если у CHP истёк сертификат)
+CHP_INSECURE_SSL = os.getenv("CHP_INSECURE_SSL", "false").lower() == "true"
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Telegram лимит
